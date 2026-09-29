@@ -382,3 +382,15 @@ bun run build
 - 提交信息简洁说明「改了什么、为什么」；一次提交聚焦单一意图。
 - 完成功能前：确保 `go build ./...`（或至少 `./cmd/server`）通过；有测试则跑 `go test ./...`，测试完毕后记得清理之前产生的测试文件。
 
+---
+
+## 11. 本地 fork 现状（个人环境，上游无此节）
+
+> 本节只适用于本机个人 fork（origin: `miyao-git/zacp`）。**开始工作前请先读 `docs/local-fork.md`**（环境、构建部署、与 qodercli 的双向同步、待办清单）。
+
+- 环境：Go 1.25.7（`~/.local/go`）、Bun 1.4.2（`~/.bun/bin`）；构建前确保两者的 bin 在 PATH
+- 构建 / 部署：`./scripts/build.sh` → `~/.zacp/tools/deploy-zacp.sh`（构建 + 安装 + 重启）；前端改动必须重新 build（dist 是 go:embed 的）
+- 当前有 3 处未提交改动（`git status`）：`MAX_WORKSPACES` 10→50、`cleanupAgentSession` 增加 `EnsureStarted`、`IsUnknownSessionErr` 识别 `invalid session identifier` —— 接手后建议先提交
+- 仓库外还有一个配套工具 `~/.zacp/tools/import-qoder-history.py`（qodercli 会话 ↔ Web 双向同步，含反向删除与防误删阈值）：改动后端删除 / 恢复逻辑时注意与其配合
+- 官方 `update.sh` / `install.sh` 会覆盖 `~/.local/bin/zacp` 软链，升级后需用 deploy 脚本重新部署自定义版
+
