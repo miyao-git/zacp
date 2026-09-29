@@ -37,17 +37,42 @@ cd ~/prj/zacp && ./scripts/build.sh
 
 # 一键部署（构建 + 安装到 ~/.zacp/bin/zacp-local + 重启 + 健康检查）
 ~/.zacp/tools/deploy-zacp.sh
+
+# 只构建、不重启 —— 在 WebUI 会话里迭代本仓库时用
+~/.zacp/tools/deploy-zacp.sh --build-only
 ```
 
 **改了前端必须重新 build**：`frontend/dist` 是 `go:embed` 进二进制的，没有热更新。
 
-## 3. 已完成的本地改动（截至 2026-09-29，未提交）
+**在 WebUI 会话里改本项目的注意事项（重要）**
+
+- 改代码 / 构建 / 测试都安全：文件在磁盘上，重启不影响
+- **重启 zacp 会杀掉承载该 WebUI 会话的进程**（agent 是 zacp 的子进程）：
+  当前回合中断、页面断连，重连后会话可继续（`session/load` 恢复上下文）。
+  这是预期行为，不是数据损坏
+- deploy 脚本的重启器运行在**独立会话**里（先启动重启器、再杀旧进程），
+  即使调用方被打死也会把服务拉回来，不会出现"杀了没起"的悬空状态；
+  重启器日志在 `/tmp/zacp-restart.log`
+- 稳妥姿势：WebUI 里的 agent 只跑 `--build-only`，重启在终端手动执行
+  （或接受会话被中断一次，直接跑不带参数的 deploy）
+- 同理，别在 WebUI 会话里执行 `pkill -x zacp`、官方 `update.sh` / `install.sh`
+  （都会重启/覆盖服务）
+
+## 3. 已完成的本地改动（截至 2026-09-29）
+
+**已提交**（`155e0b2` / `2976e11` / `7758bdb`）：
 
 1. `frontend/src/stores/session.ts`：`MAX_WORKSPACES` 10 → 50（"新建项目"前端上限；后端本就无限制，此前因导入的历史工作区超过 10 个被拦）
-2. `backend/internal/service/service.go`：`cleanupAgentSession` 先 `EnsureStarted` —— agent 被空闲回收/服务重启后，删除会话也能传播到 agent 侧（此前静默失败，会话数据残留）
+2. `backend/internal/service/service.go`：`cleanupAgentSession` 先 `EnsureStarted` —— agent 被空闲回收或服务重启后，删除会话也能传播到 agent 侧（此前静默失败、会话数据残留）
 3. `backend/internal/acp/manager/manager.go`：`IsUnknownSessionErr` 增加整短语 `invalid session identifier` 识别 —— qodercli 对「磁盘上也不存在的会话」的报错措辞，此前归类失败导致降级
 
-已验证：杀 agent 确认 → 网页删除 → qodercli 会话文件自动删除（进程被按需拉起）；无效会话删除无降级告警。
+**未提交**：
+
+4. `backend/cmd/server/main.go`：agent 预热改异步 —— 此前同步等待 qodercli 的 ACP 握手（实测 ~4.3s），HTTP 监听从 ~66ms 被拖到 ~4.4s；改为后台预热后启动恢复 ~66ms，空态/建会话由 `EnsureStarted` 幂等兜底
+5. `AGENTS.md` 与本文件的 WebUI 迭代注意事项（见 §2）
+   （仓库外）`~/.zacp/tools/deploy-zacp.sh`：新增 `--build-only`、独立会话重启器、健康检查轮询
+
+已验证：杀 agent 确认 → 网页删除 → qodercli 会话文件自动删除（进程被按需拉起）；无效会话删除无降级告警；启动耗时隔离环境实测 4446ms → 66ms，真实服务重启健康检查通过。
 
 ## 4. 与 qodercli 的会话同步（重要背景）
 

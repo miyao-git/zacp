@@ -390,7 +390,10 @@ bun run build
 
 - 环境：Go 1.25.7（`~/.local/go`）、Bun 1.4.2（`~/.bun/bin`）；构建前确保两者的 bin 在 PATH
 - 构建 / 部署：`./scripts/build.sh` → `~/.zacp/tools/deploy-zacp.sh`（构建 + 安装 + 重启）；前端改动必须重新 build（dist 是 go:embed 的）
-- 当前有 3 处未提交改动（`git status`）：`MAX_WORKSPACES` 10→50、`cleanupAgentSession` 增加 `EnsureStarted`、`IsUnknownSessionErr` 识别 `invalid session identifier` —— 接手后建议先提交
+- 本地改动已提交三个 commit（`155e0b2` 删除传播/失效识别、`2976e11` 上限 50、`7758bdb` 交接文档）；当前未提交：`backend/cmd/server/main.go`（agent 预热异步化，启动 4.4s→66ms）与两处文档更新 —— 接手后建议先提交
 - 仓库外还有一个配套工具 `~/.zacp/tools/import-qoder-history.py`（qodercli 会话 ↔ Web 双向同步，含反向删除与防误删阈值）：改动后端删除 / 恢复逻辑时注意与其配合
 - 官方 `update.sh` / `install.sh` 会覆盖 `~/.local/bin/zacp` 软链，升级后需用 deploy 脚本重新部署自定义版
+- 在 WebUI 会话里（agent 跑在 zacp 内部）迭代本项目时：改码/构建/测试都可以，
+  但**重启服务会打断当前会话**（承载进程被杀，预期且可恢复）；用
+  `deploy-zacp.sh --build-only` 只构建，重启在终端做。详见 docs/local-fork.md §2
 
