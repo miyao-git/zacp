@@ -90,6 +90,17 @@ html.dark {
   scrollbar-color: var(--color-scrollbar-thumb) transparent;
 }
 
+/*
+ * 面板拖拽调宽（usePanelResize 在拖拽期间给 <html> 加 class）：
+ * 全局列宽光标 + 禁选文本——指针扫过会话标题/消息区时不会选中文字，
+ * 且光标在整个窗口内保持 col-resize，拖拽意图始终可见。
+ */
+html.panel-resizing,
+html.panel-resizing * {
+  cursor: col-resize !important;
+  user-select: none !important;
+}
+
 /* xterm 使用独立 viewport，显式覆盖其原生滚动条以保持与页面一致。 */
 .tty-page .xterm-viewport {
   scrollbar-width: thin;

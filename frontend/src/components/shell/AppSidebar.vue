@@ -9,6 +9,7 @@ import UserFooter from '@/components/shell/UserFooter.vue'
 import DirectoryPicker from '@/components/shell/DirectoryPicker.vue'
 import { useSessionStore, MAX_WORKSPACES } from '@/stores/session'
 import { useAppStore } from '@/stores/app'
+import { usePanelResize } from '@/composables/usePanelResize'
 
 /** open：移动端抽屉开合（lg 及以上忽略，侧栏常驻流内）；desktop：桌面断点判定（inert 只在移动端关闭态启用）。desktop 必填——漏传且窗口 ≥1024 时流内侧栏会被整体 inert */
 defineProps<{ open: boolean; desktop: boolean }>()
@@ -21,6 +22,17 @@ const router = useRouter()
 const sessionStore = useSessionStore()
 const appStore = useAppStore()
 const message = useMessage()
+
+/** 左侧栏根元素：拖拽调宽时量取面板左缘（宽度 = 指针 X - 左缘） */
+const asideRef = ref<HTMLElement | null>(null)
+/**
+ * 左侧栏拖拽调宽（仅桌面端渲染手柄，见模板；移动端抽屉宽度固定 280px）。
+ * 宽度写 appStore（夹取/持久化在 store 内完成），桌面端由 :style 应用。
+ */
+const { dragging: resizing, onPointerDown: onResizeStart } = usePanelResize(
+  (clientX) => clientX - (asideRef.value?.getBoundingClientRect().left ?? Number.NaN),
+  (width) => appStore.setLeftSidebarWidth(width),
+)
 
 /** 新建项目弹窗（与 WelcomeHero 共享 appStore.newProjectModalOpen） */
 const showProjectModal = ref(false)
@@ -88,11 +100,14 @@ async function onCreateProject() {
        开合由 open + translate-x 控制，transition 实现平滑滑出。
        fixed 抽离流内后主区自动占满全宽；static 时恢复 flex 布局占位。
        顶部/底部加 env() 安全区：刘海屏竖屏时抽屉首尾的按钮不被刘海与底部横条遮挡
-       （PC 无安全区时 env() 为 0，行为不变）。 -->
+       （PC 无安全区时 env() 为 0，行为不变）。
+       桌面端宽度可拖拽调整（appStore 持久化；lg:relative 作为调宽手柄的定位上下文）。 -->
   <aside
-    class="flex w-[280px] shrink-0 flex-col border-r border-divider bg-surface transition-transform duration-300 ease-out fixed inset-y-0 left-0 z-50 lg:static lg:z-auto lg:w-[300px] lg:translate-x-0"
+    ref="asideRef"
+    class="flex w-[280px] shrink-0 flex-col border-r border-divider bg-surface transition-transform duration-300 ease-out fixed inset-y-0 left-0 z-50 lg:relative lg:z-auto lg:translate-x-0"
     :class="open ? 'translate-x-0' : '-translate-x-full'"
     style="padding-bottom: env(safe-area-inset-bottom)"
+    :style="desktop ? { width: appStore.leftSidebarEffectiveWidth + 'px' } : undefined"
     :inert="!open && !desktop"
   >
     <div class="flex items-center gap-1 pt-[max(env(safe-area-inset-top),0.75rem)] pl-[max(env(safe-area-inset-left),0.75rem)] pr-3 pb-3">
@@ -113,6 +128,20 @@ async function onCreateProject() {
 
     <SidebarSessionList class="min-h-0 flex-1 overflow-y-auto px-3 pb-4" />
     <UserFooter @open-settings="emit('open-settings')" />
+
+    <!-- 拖拽调宽手柄（仅桌面端；移动端抽屉不参与）。
+         绝对定位贴右缘并外溢 1px：命中区盖住侧栏边框，hover/拖拽高亮，光标由 CSS 提供。
+         pointerdown 由 usePanelResize 接管（拖拽中全局 col-resize 光标 + 禁选文本） -->
+    <div
+      v-if="desktop"
+      class="absolute inset-y-0 -right-px z-10 w-1.5 cursor-col-resize transition-colors"
+      :class="resizing ? 'bg-primary/40' : 'hover:bg-primary/40'"
+      role="separator"
+      aria-orientation="vertical"
+      :aria-label="t('shell.dragToResize')"
+      :title="t('shell.dragToResize')"
+      @pointerdown="onResizeStart"
+    />
   </aside>
 
   <!-- 新建项目弹窗：目录选择器（浏览 + 手动输入双通道，路径双向同步） -->

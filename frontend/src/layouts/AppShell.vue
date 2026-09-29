@@ -10,6 +10,7 @@ import SettingsModal from '@/components/shell/SettingsModal.vue'
 import { useAgentStore } from '@/stores/agent'
 import { useAppStore } from '@/stores/app'
 import { useSessionStore } from '@/stores/session'
+import { usePanelResize } from '@/composables/usePanelResize'
 import { acpSocket } from '@/composables/useAcpSocket'
 
 /**
@@ -38,6 +39,17 @@ function toggleRightPanel() {
   rightPanelOpen.value = !rightPanelOpen.value
   appStore.setRightPanelAutoExpand(rightPanelOpen.value)
 }
+
+/** 右侧面板根元素：拖拽调宽时量取面板右缘（宽度 = 右缘 - 指针 X；面板贴右，右缘即壳层右缘） */
+const rightPanelRef = ref<HTMLElement | null>(null)
+/**
+ * 右侧面板拖拽调宽（仅桌面端渲染手柄，见模板）。
+ * 宽度写 appStore（夹取与持久化在 store 内完成），模板经 :style 应用。
+ */
+const { dragging: rightResizing, onPointerDown: onRightResizeStart } = usePanelResize(
+  (clientX) => (rightPanelRef.value?.getBoundingClientRect().right ?? Number.NaN) - clientX,
+  (width) => appStore.setRightPanelWidth(width),
+)
 
 /**
  * 移动端左侧栏抽屉开关（<lg 生效；lg 及以上侧栏常驻流内，与现状一致）。
@@ -171,12 +183,30 @@ onMounted(() => {
       />
     </main>
 
-    <!-- 右侧面板：仅 lg 及以上可用（手机端不渲染、无入口）；展开/收起用宽度动画（收起时不占空间） -->
+    <!-- 右侧面板：仅 lg 及以上可用（手机端不渲染、无入口）；展开/收起用宽度动画（收起时不占空间）。
+         宽度可拖拽调整：--right-panel-w 是面板内容宽度（FilePanel 据此定宽，收起动画期间
+         保持定宽被裁剪，不触发内容重排）；拖拽中关闭宽度过渡保证跟手（见 rightResizing）。 -->
     <div
-      class="hidden shrink-0 overflow-hidden transition-[width] duration-200 lg:flex"
-      :class="rightPanelOpen ? 'w-80' : 'w-0'"
+      ref="rightPanelRef"
+      class="relative hidden shrink-0 overflow-hidden lg:flex"
+      :class="rightResizing ? '' : 'transition-[width] duration-200'"
+      :style="{
+        width: rightPanelOpen ? appStore.rightPanelEffectiveWidth + 'px' : '0px',
+        '--right-panel-w': appStore.rightPanelEffectiveWidth + 'px',
+      }"
     >
-      <FilePanel class="h-full w-80" />
+      <!-- 拖拽调宽手柄：贴面板左缘（收起时不渲染，避免 w=0 时残留命中区） -->
+      <div
+        v-if="rightPanelOpen"
+        class="absolute inset-y-0 left-0 z-10 w-1.5 cursor-col-resize transition-colors"
+        :class="rightResizing ? 'bg-primary/40' : 'hover:bg-primary/40'"
+        role="separator"
+        aria-orientation="vertical"
+        :aria-label="t('shell.dragToResize')"
+        :title="t('shell.dragToResize')"
+        @pointerdown="onRightResizeStart"
+      />
+      <FilePanel class="h-full" />
     </div>
     <SettingsModal :show="appStore.settingsOpen" @update:show="appStore.settingsOpen = $event" />
   </div>

@@ -76,6 +76,12 @@ cd ~/prj/zacp && ./scripts/build.sh
    - 前端：`SidebarSessionList` 分组顺序**完全跟随 workspaces**（不再由会话活跃度推导，消除「点开项目/聊天即跳位」）；项目头新增拖拽手柄（手写 pointer 事件：6px 阈值、项目头中点判定落点、零高度绝对定位指示线、边缘自动滚动、Esc 取消、失败提示回滚）；`SessionListItem` 状态点常驻（非活跃 = 浅灰 `idle-dot`，亮色 slate-300 / 暗色 slate-600）；`firstWorkspace` 改为 workspaces[0]（首页守卫与侧栏第一个分组同口径）
    - 已验证（headless Chrome + CDP 端到端）：拖拽到首位/中间/末尾、刷新保持、后端持久化一致、点击项目头展开折叠不回归、手柄单击不误触发、暗色浅灰点；后端隔离实例验证迁移回填 == 旧侧栏顺序、重排/超出范围 id 容错、重启不重放迁移
 
+7. **左右侧栏拖拽调宽（桌面端）**：
+   - `frontend/src/stores/app.ts`：左右栏宽度状态（localStorage `zacp.leftSidebarWidth` / `zacp.rightPanelWidth`，防抖持久化）——保存「用户设定值」，展示宽度按「硬边界 + 视口 45%」夹取（窗口变窄自动收窄、不改写设定值，窗口恢复后回原宽）；左 200–480（默认 300）、右 260–720（默认 320）
+   - 新增 `frontend/src/composables/usePanelResize.ts`（左右共用）：指针捕获、拖拽中全局 col-resize 光标 + 禁选文本（`html.panel-resizing`，main.css）、结束/卸载清理；`AppSidebar` 右缘与 `AppShell` 右侧面板左缘各一个手柄（仅 lg+；移动端抽屉仍固定 280px）
+   - 右侧面板收起动画期间内容保持定宽（`--right-panel-w` 变量，FilePanel 据此定宽被 overflow 裁剪），避免收起/拖拽时面板内重排
+   - 已验证（headless Chrome + CDP）：初始宽度生效、拖拽后宽度、防抖持久化、刷新保持、上下限夹取（480 / 260）、拖拽不选中文本、收起动画中内容不重排
+
 （前批改动验证记录：杀 agent 确认 → 网页删除 → qodercli 会话文件自动删除（进程被按需拉起）；无效会话删除无降级告警；启动耗时隔离环境实测 4446ms → 66ms，真实服务重启健康检查通过。）
 
 ## 4. 与 qodercli 的会话同步（重要背景）
