@@ -319,10 +319,15 @@ function insertRefs(names: string[]) {
 // 本轮结束后 store 自动接力发送队首（见 session store flushSteerQueue）。
 // ---------------------------------------------------------------------------
 
-/** 每层露出的高度：等于卡片内文本行的高度（顶对齐），保证每条消息都能看到 */
-const STEER_CARD_PEEK_PX = 24
-/** 卡片高度（h-9 = 36px；被压住的下半部分是空白，作为「牌」的厚度） */
-const STEER_CARD_HEIGHT_PX = 36
+/** 每层露出的高度：文本行（pt-1 + leading-5 = 24px）+ 上下各 4px 呼吸边距 */
+const STEER_CARD_PEEK_PX = 28
+/**
+ * 卡片高度（h-11 = 44px）= 露出 28px + 被压住 16px。
+ * 被压住部分必须 ≥ 下方卡片的上圆角半径：steer 卡之间为 12px、最下一张与输入卡
+ * 交界为 16px（输入卡 top 圆角 2xl）。只有压住量 ≥ 半径，下卡的上圆弧才会正好落
+ * 在本卡直侧边上，叠放侧线连续、交界不出现「折回去」的缺口或透底。
+ */
+const STEER_CARD_HEIGHT_PX = 44
 
 /** 当前会话排队中的 steer 消息（草稿态无队列） */
 const steerItems = computed(() => sessionStore.steerQueueOf(sessionStore.currentId))
@@ -534,16 +539,17 @@ function onKeydown(e: KeyboardEvent) {
          编辑按钮（取回输入框修改）。本轮结束后 store 自动接力发送队首。 -->
     <div
       v-if="steerStackItems.length"
-      class="relative -mb-1.5 w-full"
+      class="relative -mb-4 w-full"
       :style="{ height: `${steerStackHeight}px` }"
     >
-      <!-- 每张 steer 卡片保留自身的圆角（叠放时只露上边，看得到的就是卡片上沿）；
-           与输入框相接的那一段由输入框去上圆角抹平，避免交界处出现「折回去」的缺口 -->
+      <!-- 叠放卡片只圆上边、下边直角：叠放时每张只露上沿，直侧边向下延伸被更靠前的
+           一张压住；下卡的上圆弧（半径 ≤ 压住量 16px）正好落在本卡侧边上，整叠侧线
+           连续、交界不出现「折回去」的缺口 -->
       <div
         v-for="(item, i) in steerStackItems"
         :key="item.id"
         data-steer-card
-        class="absolute inset-x-0 flex h-9 items-start gap-2 rounded-xl border border-divider bg-surface-raised px-3 pt-1 shadow-md"
+        class="absolute inset-x-0 flex h-11 items-start gap-2 rounded-t-xl border border-divider bg-surface-raised px-3 pt-1 shadow-md"
         :style="steerLayerStyle(i)"
       >
         <span class="min-w-0 flex-1 truncate text-sm leading-5 text-ink-secondary" :title="item.text">
@@ -561,13 +567,13 @@ function onKeydown(e: KeyboardEvent) {
       </div>
     </div>
 
-    <!-- 输入卡片：有 steer 叠层时压住其下沿、并去掉上圆角（交界处成一条直线，
-         不出现「折回去」的缺口）；无叠层时保持完整圆角。
+    <!-- 输入卡片：始终保留完整圆角（含上边）。有 steer 叠层时叠层以 -mb-4 上覆本卡
+         顶部 16px，恰等于本卡上圆角半径：上圆弧落在最下一张 steer 卡的直侧边上，
+         交界与 steer 卡之间一样呈连续叠放效果，无需去掉上圆角。
          data-composer-card：ChatPane 据此测量「卡片中部」位置，作为底部渐强模糊的起点 -->
     <div
       data-composer-card
-      class="relative z-40 w-full border border-divider bg-surface-raised p-3 shadow-sm transition-shadow focus-within:border-divider focus-within:shadow-md"
-      :class="steerStackItems.length ? 'rounded-b-2xl' : 'rounded-2xl'"
+      class="relative z-40 w-full rounded-2xl border border-divider bg-surface-raised p-3 shadow-sm transition-shadow focus-within:border-divider focus-within:shadow-md"
     >
     <!-- / 命令候选面板：浮于输入框上方，宽度与输入框一致（容器 relative + 左右对齐） -->
     <div
