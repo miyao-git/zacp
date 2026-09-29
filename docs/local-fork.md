@@ -82,6 +82,12 @@ cd ~/prj/zacp && ./scripts/build.sh
    - 右侧面板收起动画期间内容保持定宽（`--right-panel-w` 变量，FilePanel 据此定宽被 overflow 裁剪），避免收起/拖拽时面板内重排
    - 已验证（headless Chrome + CDP）：初始宽度生效、拖拽后宽度、防抖持久化、刷新保持、上下限夹取（480 / 260）、拖拽不选中文本、收起动画中内容不重排
 
+8. **修复：turn.done 增量合并可能丢用户消息气泡**（`frontend/src/stores/session.ts` `loadMessageUpdates`）：
+   - 现象：用户发出的消息气泡在消息列表消失，只有助手回复可见（刷新页面后消息回来，DB 数据完好）
+   - 根因面：合并重建时乐观 user 占位被无条件丢弃，依赖增量接口返回的本轮 DB user 正版补位；一旦该响应缺 user（异常/竞态），消息就凭空消失
+   - 修复：增量缺本轮 DB user 时保留乐观 user 气泡（`dbUserMessage` 判定）；已验证正常路径无重复、用 CDP 拦截增量响应剥掉 user 后气泡仍保留
+   - 排查线索（下次复现时看）：线上日志里该轮 prompt 报过 `acp session invalid, recovering`（服务重启后首条 prompt 触发 session/load），恢复重放的事件会被写进该轮 assistant 消息（时间线里能看到更早的 `user_message`/`tool_call`，消息体积异常大）——若有异常，先看这一轮的日志与消息 events
+
 （前批改动验证记录：杀 agent 确认 → 网页删除 → qodercli 会话文件自动删除（进程被按需拉起）；无效会话删除无降级告警；启动耗时隔离环境实测 4446ms → 66ms，真实服务重启健康检查通过。）
 
 ## 4. 与 qodercli 的会话同步（重要背景）

@@ -900,12 +900,18 @@ export const useSessionStore = defineStore('session', () => {
       mainDb = turnSeg.find((m) => m.role === 'assistant')
       additions = turnSeg.filter((m) => m !== mainDb)
     }
+    // 本轮是否拿到 DB 正版 user：正常路径必存在（后端 prompt 到达即落库）。
+    // 缺失（异常/竞态，如增量只返回了 assistant）时必须保留本地乐观 user 气泡——
+    // 否则用户刚发出的消息会在 turn.done 合并这一瞬间凭空消失（DB 数据仍在，
+    // 刷新后由正版接管；见下方 rebuilt 的保留条件）。
+    const dbUserMessage = turnSeg?.find((m) => m.role === 'user')
 
     // 按原顺序重建列表：正 id 消息、已转正占位（负 id + streamFinalized）、本轮占位
     // 原位保留；异步窗口内仍被引用的新轮占位与乐观 user（连发竞态）一并保留；
     // 取消/错误轮的未转正残留占位一律丢弃，与后端状态对齐。
     // 注意：乐观 user 仅在「是当前引用且不是本轮」时保留——本轮 user 的负 id 版
-    // 由下面 additions 里的 DB 正 id 版回归替换，两者并存会重复渲染。
+    // 由下面 additions 里的 DB 正 id 版回归替换，两者并存会重复渲染；
+    // 例外：增量缺本轮 DB user 时保留本轮乐观 user（见 dbUserMessage）。
     const currentUserId = streamUserIdBySession.value[sessionId]
     const rebuilt: ChatMessage[] = []
     for (const message of oldList) {
@@ -917,7 +923,8 @@ export const useSessionStore = defineStore('session', () => {
         pendingFinalizePlaceholders.has(message.id) ||
         (currentUserId !== undefined &&
           message.id === currentUserId &&
-          message.id !== placeholderUserId)
+          message.id !== placeholderUserId) ||
+        (!dbUserMessage && placeholderUserId !== undefined && message.id === placeholderUserId)
       ) {
         rebuilt.push(message)
       }
