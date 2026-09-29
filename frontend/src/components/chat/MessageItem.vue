@@ -199,9 +199,12 @@ onMounted(() => {
  */
 const blocks = computed<MessageBlock[]>(() => {
   // 流式占位消息（含「软收尾后、转正前」窗口：status 已回 idle 但占位尚未
-  // 合并进 DB）：使用 store.streamBlocks（随事件增量构建，turn.done 后由
-  // finalizeStream 保留至 refreshAfterTurn 转正）。已转正占位（streamFinalized）
-  // 与历史消息一样从 events 重建——保持消息高度连续，避免滚动跳动。
+  // 合并进 DB）：用 store 的占位块——当前轮占位取实时 blocks（随事件增量构建），
+  // 已被新一轮取代的旧占位取冻结快照（见 store.placeholderBlocksOf /
+  // frozenBlocksBySession）。绝不能一律取会话级实时 blocks：同一会话同时存在两个
+  // 未转正占位时，旧占位会把新一轮的内容整段再渲染一份。
+  // 已转正占位（streamFinalized）与历史消息一样从 events 重建——保持消息高度连续，
+  // 避免滚动跳动。
   // 注意：必须限定 role === 'assistant'——乐观 user 消息的 id 也是负数
   // （appendLocal 用 -Date.now()），若不加过滤，user 消息会把整个会话的
   // streamBlocks（AI 实时内容）也渲染一份，流式期间出现 2 份重复内容。
@@ -211,7 +214,7 @@ const blocks = computed<MessageBlock[]>(() => {
       props.message.role === 'assistant' &&
       !props.message.streamFinalized)
   ) {
-    return sessionStore.streamBlocksOf(props.message.sessionId)
+    return sessionStore.placeholderBlocksOf(props.message)
   }
   // 历史消息：从 events 重建，tool block 携带 contentSplit 位置
   if (props.message.role !== 'assistant' || !props.message.events) {

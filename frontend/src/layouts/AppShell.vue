@@ -7,6 +7,7 @@ import AppSidebar from '@/components/shell/AppSidebar.vue'
 import ChatPane from '@/components/chat/ChatPane.vue'
 import FilePanel from '@/components/files/FilePanel.vue'
 import SettingsModal from '@/components/shell/SettingsModal.vue'
+import PermissionModal from '@/components/chat/PermissionModal.vue'
 import { useAgentStore } from '@/stores/agent'
 import { useAppStore } from '@/stores/app'
 import { useSessionStore } from '@/stores/session'
@@ -209,5 +210,12 @@ onMounted(() => {
       <FilePanel class="h-full" />
     </div>
     <SettingsModal :show="appStore.settingsOpen" @update:show="appStore.settingsOpen = $event" />
+
+    <!-- 权限确认弹窗：挂在壳层而不是消息列表里。
+         agent 可能在「草稿会话刚发出首条消息、路由还没切到 /sessions/:id」
+         或「会话还在解析中」时就发起权限请求，那时消息列表根本没渲染，
+         弹窗会整个丢失（用户侧表现为权限框有时候弹不出来，agent 一直等到超时）。
+         弹窗本身由 store 的待处理队列驱动，挂在这里任何路由下都能弹出。 -->
+    <PermissionModal />
   </div>
 </template>

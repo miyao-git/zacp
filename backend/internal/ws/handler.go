@@ -106,6 +106,13 @@ func (h *Handler) ServeHTTPWithSession(sessionID, agentID string, bridge *EventB
 // 同一连接可同时订阅多个会话，进行中会话的广播不会因切到其它会话而丢失）
 // 优化：一次性 json.Marshal，N 个订阅者复用结果（省 N-1 次 Marshal），
 // 每客户端拷贝一份 []byte 再入队，避免多 goroutine 共享底层数组的潜在竞态，语义与原逐个 Marshal 等价。
+//
+// 发送缓冲已满的连接直接踢掉，而不是丢帧：缓冲满说明该连接已经跟不上
+// （浏览器标签页被冻结、网络拥塞、对端不再读取），此时丢帧是不可恢复的——
+// 前端既不知道少了内容，也可能收不到 turn.done，页面就此停住，只能整页刷新
+// （线上日志里单分钟 4000+ 条 "dropping message" 就是这个状态）。
+// 踢掉后浏览器立刻感知关闭并重连，重连的 resync 会带回本轮完整快照
+// （见 EventBridge.HandleResync），内容不丢，用户只看到一次短暂的连接抖动。
 func (h *Handler) BroadcastToSession(sessionID string, msg ServerMessage) {
 	data, err := json.Marshal(msg)
 	if err != nil {
@@ -113,8 +120,7 @@ func (h *Handler) BroadcastToSession(sessionID string, msg ServerMessage) {
 		return
 	}
 	h.hub.mu.RLock()
-	defer h.hub.mu.RUnlock()
-
+	var stalled []*Client
 	for client := range h.hub.clients {
 		if client.IsSubscribed(sessionID) {
 			cpy := make([]byte, len(data))
@@ -122,9 +128,18 @@ func (h *Handler) BroadcastToSession(sessionID string, msg ServerMessage) {
 			select {
 			case client.send <- cpy:
 			default:
-				h.log.Warn("send buffer full, dropping message", "sessionID", sessionID)
+				h.log.Warn("send buffer full, evicting client", "sessionID", sessionID)
+				stalled = append(stalled, client)
 			}
 		}
+	}
+	h.hub.mu.RUnlock()
+
+	// 关闭必须放到释放 hub 锁之后：client.Close 会向无缓冲的 unregister 通道发送，
+	// hub.Run 消费它时要拿写锁，若本函数还持着读锁就是死锁（与 CloseAll 同一约束）。
+	// 异步执行：调用方通常在 agent 事件回调链上，不应被注销流程阻塞。
+	for _, c := range stalled {
+		go c.Close()
 	}
 }
 
@@ -189,6 +204,17 @@ func (h *Handler) BroadcastPermissionRequest(sessionID, permissionID string, too
 		PermissionID: permissionID,
 		ToolCall:     toolCall,
 		Options:      options,
+	})
+}
+
+// BroadcastPermissionResolved 通知前端某个权限请求已被处理（用户已选择，或等待超时
+// 被自动取消）：收到后应从待处理队列移除该请求并撤下弹窗。
+// 多标签页打开同一会话时，只有发起选择的那个页面知道自己已经点过，其余页面靠本广播同步。
+func (h *Handler) BroadcastPermissionResolved(sessionID, permissionID string) {
+	h.BroadcastToSession(sessionID, ServerMessage{
+		Type:         MsgTypePermissionResolved,
+		SessionID:    sessionID,
+		PermissionID: permissionID,
 	})
 }
 

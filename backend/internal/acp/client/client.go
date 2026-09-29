@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	acp "github.com/coder/acp-go-sdk"
 )
@@ -44,6 +45,11 @@ type Event struct {
 	Output any `json:"output,omitempty"`
 	// Plan 为 agent 执行计划（仅 plan 事件携带；整体替换语义，见 Plan 注释）
 	Plan *Plan `json:"plan,omitempty"`
+	// Seq 为事件序号（Bridge 级单调递增，永不重置；见 Bridge.eventSeq）。
+	// 用途：WS resync 回放的幂等判定——「入缓存」与「广播」在 push 里不是原子的，
+	// 快照里已包含的事件可能在回放之后才广播出去，前端按 seq 认出并丢弃重复投递。
+	// 放在结构体末尾：落库 JSON 依赖 type 为首字段（见 eventstore.ContainsThought）。
+	Seq uint64 `json:"seq,omitempty"`
 }
 
 // Bridge is an ACP Client that buffers session updates and forwards live events.
@@ -64,6 +70,11 @@ type Bridge struct {
 	// 历史回放、不是本轮输出。静音期间该 session 的 push 事件直接丢弃：不入缓存、
 	// 不触发 onEvent 广播。
 	mutedSessions map[string]bool
+	// eventSeq 事件序号发号器（Bridge 级、单调递增、进程内永不重置）。
+	// 每次 push 分配一个，随事件一起广播并留在缓存里；WS resync 回放时把快照的
+	// 最大 seq 一并下发，前端据此丢弃「快照里已包含、却在回放之后才广播到」的
+	// 重复事件（push 的入缓存与回调广播不是原子的，见 Event.Seq）。
+	eventSeq atomic.Uint64
 	// onEvent is optional live callback (e.g. print to stdout).
 	onEvent func(Event)
 	// configOptionsHandler 接收 agent 经 session/update 通知下发的 configOptions
@@ -194,6 +205,9 @@ func (b *Bridge) push(e Event) {
 		b.mu.Unlock()
 		return
 	}
+	// 入缓存前分配序号：缓存副本与随后广播出去的副本携带同一个 seq，
+	// 前端才能把「回放快照里已包含、广播却晚于回放到达」的事件识别为重复投递
+	e.Seq = b.eventSeq.Add(1)
 	events := b.eventsBySession[e.SessionID]
 	if len(events) >= maxEventsPerSession {
 		// 软上限：头部裁剪保尾，避免异常会话无界堆积导致 OOM。

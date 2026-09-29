@@ -140,6 +140,12 @@ func (c *Client) WritePump(ctx context.Context) {
 	for {
 		select {
 		case message, ok := <-c.send:
+			if !ok {
+				// send channel 已关闭（连接被注销）：不能再写，直接退出由 defer 关连接。
+				// 先写后判 ok 会往正在关闭的连接上写一个空帧，
+				// 并让每次正常断开都在日志里留一条误导性的 "write error"。
+				return
+			}
 			writeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 			err := c.conn.Write(writeCtx, websocket.MessageText, message)
 			cancel()
@@ -148,10 +154,6 @@ func (c *Client) WritePump(ctx context.Context) {
 				// WritePump 退出会 Close 连接，阻塞中的 ReadPump 随之报 read error——
 				// 日志里 write/read 成对出现时，根因在写方向（对端不再消费/网络中断）。
 				c.hub.log.Error("write error", "error", err, "closeStatus", websocket.CloseStatus(err))
-				return
-			}
-			if !ok {
-				// send channel was closed
 				return
 			}
 
@@ -169,7 +171,10 @@ func (c *Client) WritePump(ctx context.Context) {
 	}
 }
 
-// Send 发送消息给客户端
+// Send 发送消息给客户端。
+// 缓冲已满时与 BroadcastToSession 同一策略：踢掉连接而不是丢帧——丢帧不可恢复
+// （前端不知道少了内容，也可能收不到 turn.done），踢掉后浏览器会重连并经 resync
+// 拿回本轮完整快照。
 func (c *Client) Send(msg ServerMessage) {
 	data, err := json.Marshal(msg)
 	if err != nil {
@@ -180,7 +185,10 @@ func (c *Client) Send(msg ServerMessage) {
 	select {
 	case c.send <- data:
 	default:
-		c.hub.log.Warn("send buffer full, dropping message")
+		c.hub.log.Warn("send buffer full, evicting client")
+		// 异步关闭：调用方可能正持有 hub 读锁（如 RebindSession），
+		// 而 Close 要经无缓冲的 unregister 通道等 hub.Run 拿写锁，同步调用会死锁。
+		go c.Close()
 	}
 }
 
@@ -240,18 +248,20 @@ func (c *Client) handleMessage(ctx context.Context, msg ClientMessage) {
 		// 只订阅、不发 prompt——对仍在执行/排队的会话重发 prompt 会触发
 		// ErrPromptInProgress；running=true 时前端恢复 streaming 继续接收
 		// 后续事件，running=false 时前端按 DB 全量收尾（列表已完整，无需动作）。
+		// 订阅必须先于 HandleResync：回放与随后的实时事件都要能投递到本连接。
 		if msg.SessionID != "" {
 			c.SubscribeSession(msg.SessionID, msg.AgentID)
 		}
-		running := false
 		if bridge != nil {
-			running = bridge.HasPromptInProgress(msg.AgentID, msg.SessionID)
+			// 除执行状态外，还会补发本轮已产出的事件与未决的权限请求
+			//（前端刷新后这两样都随旧页面丢了，见 EventBridge.HandleResync）
+			bridge.HandleResync(c, msg.AgentID, msg.SessionID)
+		} else {
+			c.Send(ServerMessage{
+				Type:      MsgTypeSessionResynced,
+				SessionID: msg.SessionID,
+			})
 		}
-		c.Send(ServerMessage{
-			Type:      MsgTypeSessionResynced,
-			SessionID: msg.SessionID,
-			Running:   running,
-		})
 
 	case MsgTypePing:
 		c.Send(ServerMessage{Type: MsgTypePong})

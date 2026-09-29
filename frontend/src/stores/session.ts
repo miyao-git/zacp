@@ -21,7 +21,7 @@ import {
 } from '@/api'
 import { acpSocket } from '@/composables/useAcpSocket'
 import { playSuccessTone } from '@/utils/successTone'
-import type { MessageBlock } from '@/composables/useMessageBlocks'
+import { deriveBlocks, type MessageBlock } from '@/composables/useMessageBlocks'
 import type {
   AvailableCommand,
   ChatMessage,
@@ -34,6 +34,7 @@ import type {
   PermissionOption,
   PermissionToolCall,
   Plan,
+  TurnReplay,
   WsEvent,
   WsServerMessage,
 } from '@/types/ws'
@@ -78,6 +79,13 @@ const TURN_FUSE_INTERVAL_MS = 60_000
  * idle 旧会话不参与，避免无谓的订阅与查询。
  */
 const RESYNC_ACTIVE_WINDOW_MS = 15 * 60_000
+
+/**
+ * resync 裁决的时效保护：本地刚发出 prompt 后这段时间内到达的 session.resynced，
+ * 其 running=false 结论一律忽略。该响应是发送之前发出的（描述的是上一轮状态），
+ * 若据此收尾会把用户刚发起的新轮占位与流式槽位一起清掉。
+ */
+const RESYNC_STALE_GUARD_MS = 10_000
 
 /**
  * 会话解析超时：进入 /sessions/:id 时以 GET /sessions/:id 校验会话存在性，
@@ -200,6 +208,26 @@ export const useSessionStore = defineStore('session', () => {
    * 收到该会话任何广播、或发送 prompt 时刷新；会话收尾时删除。
    */
   const lastEventAtBySession = new Map<number, number>()
+  /** 各会话最近一次成功发出 prompt 的时间（resync 裁决时效保护，见 RESYNC_STALE_GUARD_MS） */
+  const lastPromptSentAtBySession = new Map<number, number>()
+  /**
+   * 各会话「已回放到的事件序号」（resync 回放的幂等下界）。
+   *
+   * 后端 push 的「入缓存」与「广播」不是原子的：快照里已包含的事件，可能在回放
+   * 之后才广播到本端。回放是**整体替换**语义，这类事件若再被追加一次就会重复
+   *（表现为文字重了一遍）。因此 seq 不大于本下界的实时事件一律丢弃。
+   *
+   * 生命周期与「一轮」绑定（新轮开始/收尾时清除）：后端进程重启后序号会从 0
+   * 重新发号，跨轮保留旧下界会把新一轮的事件全部误判为重复。
+   */
+  const replaySeqBySession = new Map<number, number>()
+  /**
+   * 各会话已应用的最高事件序号（实时事件与回放都会推进）。
+   * 用来判断 resync 回放是否「比本地更新」：切进一个一直在正常收事件的会话时，
+   * 回放内容与本地完全一致，重复重建会让工具卡组件重新挂载（展开态丢失）、
+   * 白做一次全量渲染，因此只在回放确实更靠前时才应用。
+   */
+  const lastEventSeqBySession = new Map<number, number>()
   /** 新建会话/草稿阶段使用的全局错误；已有 session 的错误单独存储。 */
   const streamError = ref<string | null>(null)
   /** 已有 session 的错误提示，避免后台 session 的错误串到当前窗口。 */
@@ -223,6 +251,13 @@ export const useSessionStore = defineStore('session', () => {
    * 消息切换到历史路径（由消息 events 重建 text/tool）。
    */
   const streamBlocksBySession = ref<Record<number, MessageBlock[]>>({})
+  /**
+   * 各会话当前 turn 的思考（agent_thought）累积文本。
+   * 与 streamBlocks 分开存的原因：思考内容渲染在占位消息的 reasoning 上，
+   * 而占位消息可能还不存在（消息列表尚未加载完就收到了事件），只写消息字段会丢；
+   * 存在会话级槽位里，createStreamPlaceholder 补建占位时可一并回灌。
+   */
+  const streamReasoningBySession = ref<Record<number, string>>({})
   /** 各会话当前流式 assistant 占位消息 id（-1 表示无占位） */
   const streamMsgIdBySession = ref<Record<number, number>>({})
   /** 各会话当前轮乐观 user 消息 id（连发竞态时，旧轮的合并不得丢弃新轮的乐观 user） */
@@ -235,6 +270,12 @@ export const useSessionStore = defineStore('session', () => {
    */
   const pendingFinalizePlaceholders = new Set<number>()
   /**
+   * 在途的收尾同步（refreshAfterTurn）去重键：`会话id:占位id`。
+   * turn.done 与 resync 裁决可能几乎同时触发同一轮的收尾，两次增量拉取用同一个
+   * afterId，会把本轮 user 消息插两遍；按键去重后不同轮次仍各自执行。
+   */
+  const refreshInFlight = new Set<string>()
+  /**
    * 已转正占位消息对应的 DB 消息 id（占位转正后保留负 id 稳定 v-for key，
    * 真实 id 记在这里：latestPersistedMessageId 据此推进增量拉取的 afterId，
    * 避免下轮 turn.done 重复拉取已转正消息）。外层 key 为 session id，内层为
@@ -242,6 +283,64 @@ export const useSessionStore = defineStore('session', () => {
    * 会话删除时随 dropSessionIndexes 清理。
    */
   const finalizedDbIdBySession = new Map<number, Map<number, number>>()
+
+  /**
+   * 已被新一轮取代、但尚未转正的占位消息的内容快照（外层 key: session id，
+   * 内层: 占位消息 id → 冻结的 blocks）。
+   *
+   * 为什么需要：streamBlocksBySession 是「会话级当前轮」的单一槽位，而占位消息
+   * 在转正（DB 版合并进来）之前一直按 id<0 渲染这个槽位。同一会话出现两个未转正
+   * 占位时（上一轮 turn.done 已回、refreshAfterTurn 还在途时用户就发了下一条；
+   * 或出错/保险丝收尾后残留占位），旧占位会把**新一轮**的实时内容整段渲染出来，
+   * 表现为「刚发的消息跑到上一轮回复中间 / 同一段回复出现两份」。
+   * 冻结后旧占位只认自己的快照，直到 DB 正版把它转正（转正在 MessageItem 里
+   * 走 events 路径，快照随即失效并被清理）。
+   *
+   * 冻结语义：直接持有当时的 blocks 数组引用即可——会话槽位随后被赋值为**新数组**
+   * （不是在原数组上继续 push），旧数组与其 block 对象不会再被修改。
+   */
+  const frozenBlocksBySession = new Map<number, Map<number, MessageBlock[]>>()
+
+  /** 冻结指定会话当前轮占位的 blocks（新一轮开始 / 收尾清空槽位前调用） */
+  function freezeStreamBlocks(sessionId: number) {
+    const placeholderId = streamMsgIdBySession.value[sessionId]
+    const blocks = streamBlocksBySession.value[sessionId]
+    if (placeholderId === undefined || !blocks?.length) {
+      return
+    }
+    let byMsg = frozenBlocksBySession.get(sessionId)
+    if (!byMsg) {
+      byMsg = new Map()
+      frozenBlocksBySession.set(sessionId, byMsg)
+    }
+    byMsg.set(placeholderId, blocks)
+  }
+
+  /**
+   * 清理不再需要的冻结快照：只保留「仍在列表里且未转正」的占位。
+   * 占位转正（streamFinalized）或被合并逻辑丢弃后，快照即成为垃圾，
+   * 其中可能引用体积可观的工具入参/出参，必须随列表重建及时释放。
+   */
+  function pruneFrozenBlocks(sessionId: number) {
+    const byMsg = frozenBlocksBySession.get(sessionId)
+    if (!byMsg) {
+      return
+    }
+    const alive = new Set<number>()
+    for (const m of messagesById.value[sessionId] ?? []) {
+      if (m.id < 0 && !m.streamFinalized && m.role === 'assistant') {
+        alive.add(m.id)
+      }
+    }
+    for (const id of byMsg.keys()) {
+      if (!alive.has(id)) {
+        byMsg.delete(id)
+      }
+    }
+    if (byMsg.size === 0) {
+      frozenBlocksBySession.delete(sessionId)
+    }
+  }
 
   /**
    * 取最新 100 条历史消息中的最后一个执行计划。
@@ -333,17 +432,22 @@ export const useSessionStore = defineStore('session', () => {
 		}
 		sentSessions.delete(sessionId)
 		initialSessionDetailRefresh.delete(sessionId)
+		lastEventAtBySession.delete(sessionId)
+		lastPromptSentAtBySession.delete(sessionId)
+		resetReplayTracking(sessionId)
 		delete messagesStatus.value[sessionId]
 		delete statusBySession.value[sessionId]
 		runningSessionIds.value.delete(sessionId)
 		delete streamErrorBySession.value[sessionId]
 		delete pendingPermissionsBySession.value[sessionId]
 		delete streamBlocksBySession.value[sessionId]
+		delete streamReasoningBySession.value[sessionId]
 		delete activeToolCardsBySession.value[sessionId]
 		delete activePlanBySession.value[sessionId]
 		delete streamMsgIdBySession.value[sessionId]
 		delete streamUserIdBySession.value[sessionId]
 		finalizedDbIdBySession.delete(sessionId)
+		frozenBlocksBySession.delete(sessionId)
 		delete steerQueueBySession.value[sessionId]
 	}
   /** 首轮 prompt 后若仍是默认标题，安排一次会话详情同步；手动改名会话不参与。 */
@@ -359,6 +463,16 @@ export const useSessionStore = defineStore('session', () => {
   function statusOf(sessionId: number | null | undefined): SessionStreamStatus {
     if (sessionId === null || sessionId === undefined) return 'idle'
     return statusBySession.value[sessionId] ?? 'idle'
+  }
+
+  /**
+   * 关键广播的归属兜底：ACP session id 不在本地索引里时（执行中 agent 重启换了新 id、
+   * 索引尚未建立等），若本端只有一个会话在跑就归给它；多会话并行无法区分则返回 null。
+   * 只用于「丢了就再也补不回来」的广播（turn.done / error / permission.*）；
+   * 普通事件流仍严格按索引路由，未知会话直接丢弃，避免串台。
+   */
+  function fallbackRunningSid(): number | null {
+    return runningSessionIds.value.size === 1 ? [...runningSessionIds.value][0] : null
   }
 
 	/** 取指定 session 的错误提示；后台 session 的错误不污染当前窗口。 */
@@ -404,6 +518,21 @@ export const useSessionStore = defineStore('session', () => {
   function streamBlocksOf(sessionId: number | null | undefined): MessageBlock[] {
     if (sessionId === null || sessionId === undefined) return []
     return streamBlocksBySession.value[sessionId] ?? []
+  }
+
+  /**
+   * 取某个占位消息应渲染的消息块（MessageItem 唯一入口）。
+   * - 当前轮占位（id 命中会话槽位）→ 实时 blocks，随事件增长；
+   * - 已被新一轮取代的旧占位 → 冻结快照（见 frozenBlocksBySession）；
+   * - 两者都不是（异常/已清理）→ 空数组，绝不回退到实时 blocks，
+   *   否则旧占位会把新一轮的内容再渲染一份。
+   */
+  function placeholderBlocksOf(message: ChatMessage): MessageBlock[] {
+    const sessionId = message.sessionId
+    if (message.id === (streamMsgIdBySession.value[sessionId] ?? NaN)) {
+      return streamBlocksBySession.value[sessionId] ?? []
+    }
+    return frozenBlocksBySession.get(sessionId)?.get(message.id) ?? []
   }
 
   /** 取会话的实时工具卡片 */
@@ -698,6 +827,10 @@ export const useSessionStore = defineStore('session', () => {
         return // 已切换到其它会话，丢弃过期结果
       }
       upsertSession(session)
+      // 进入会话即恢复订阅并确认执行状态：侧栏是按项目懒加载的，本会话可能不在
+      // 连接建立时那轮扫描范围内——那样后端就不会把它的广播投给本连接，
+      // 会话明明在跑，页面却收不到任何输出。
+      resyncSession(session)
       sessionResolve.value = { status: 'ready', message: null }
       await Promise.allSettled([
         loadMessages(sessionId),
@@ -805,6 +938,8 @@ export const useSessionStore = defineStore('session', () => {
       })
       messagesById.value[sessionId] = [...page.messages, ...local]
       messagesStatus.value[sessionId] = 'ready'
+      // 窗口重建会丢弃部分本地占位：同步回收其冻结快照，避免无主引用常驻
+      pruneFrozenBlocks(sessionId)
     } catch {
       // 历史加载失败不阻塞会话页打开（会话校验失败才决定错误态）；
       // 记录 error 供 UI 显示「加载失败 + 重试」，而不是误显「暂无消息」。
@@ -1146,6 +1281,15 @@ export const useSessionStore = defineStore('session', () => {
 
   let wsRegistered = false
 
+  /** 占位消息正文 = 实时块里的文本按时间线拼接（工具卡不参与正文字段） */
+  function joinTextBlocks(blocks: MessageBlock[]): string {
+    let text = ''
+    for (const b of blocks) {
+      if (b.kind === 'text') text += b.content
+    }
+    return text
+  }
+
   /**
    * 建立流式占位消息（无则建；sendViaWs 发 prompt、resync 续流、事件先到兜底、
    * 切换会话补建共用同一套「槽位 + 列表落点」语义）：
@@ -1154,7 +1298,8 @@ export const useSessionStore = defineStore('session', () => {
    * - 全新：生成占位 id（负值，与 DB 正 id 区分；-Date.now()-1 与用户消息
    *   -Date.now() 错开，防同毫秒撞 key）并记录槽位；列表已加载则追加到末尾。
    * 占位内容默认空串（正文由 appendStreamChunk 原地追加）；首次创建时若
-   * streamBlocks 已有累积（非当前会话先收到事件），回灌已累积文本。
+   * streamBlocks / 思考槽位已有累积（事件先于列表加载到达、或 resync 回放），
+   * 一并回灌正文与思考，避免这部分内容丢失。
    */
   function createStreamPlaceholder(sessionId: number): number {
     const list = messagesById.value[sessionId]
@@ -1167,16 +1312,12 @@ export const useSessionStore = defineStore('session', () => {
       streamMsgIdBySession.value[sessionId] = placeholderId
     }
     if (list !== undefined) {
-      const text = (streamBlocksBySession.value[sessionId] ?? [])
-        .filter((b) => b.kind === 'text')
-        .map((b) => b.content)
-        .join('')
       const placeholder: ChatMessage = {
         id: placeholderId,
         sessionId,
         role: 'assistant',
-        content: text,
-        reasoning: '',
+        content: joinTextBlocks(streamBlocksBySession.value[sessionId] ?? []),
+        reasoning: streamReasoningBySession.value[sessionId] ?? '',
         createdAt: new Date().toISOString(),
       }
       messagesById.value[sessionId] = [...list, placeholder]
@@ -1218,6 +1359,10 @@ export const useSessionStore = defineStore('session', () => {
     if (msgId === undefined) {
       msgId = createStreamPlaceholder(sessionId)
     }
+    // 会话级槽位同步累积：占位消息还没进列表（历史仍在加载）时，
+    // 思考文本只能先存这里，等 createStreamPlaceholder 补建占位时回灌
+    streamReasoningBySession.value[sessionId] =
+      (streamReasoningBySession.value[sessionId] ?? '') + text
     const list = messagesById.value[sessionId]
     const last = list?.[list.length - 1]
     if (last && last.id === msgId) {
@@ -1271,6 +1416,85 @@ export const useSessionStore = defineStore('session', () => {
     }
   }
 
+
+  /**
+   * 用后端回放的本轮事件重建流式状态（刷新/重连后续流的核心）。
+   *
+   * 整体替换语义：回放是本轮到此为止的**完整快照**，直接覆盖 blocks / 工具卡 /
+   * plan / 正文 / 思考即可——回放前已到达的实时内容都在快照里，不会丢；
+   * 回放后产生的事件序号更大，继续按增量追加，不会重复。
+   * 唯一需要防的是「快照里已含、广播却晚于回放到达」的事件（后端入缓存与广播
+   * 不是原子的），由 replaySeqBySession 按序号挡掉。
+   *
+   * 回放格式与历史消息落库一致（文本碎片已合并、工具详情抽到 toolDetails），
+   * 因此直接复用 deriveBlocks，重建结果与本轮结束后从 events 渲染的结果同形。
+   */
+  function restoreStreamFromReplay(sessionId: number, replay: TurnReplay) {
+    const events = Array.isArray(replay.events) ? replay.events : []
+    if (events.length === 0) {
+      return
+    }
+    // 记下回放覆盖到的事件序号：此后到达、但序号不大于它的实时事件是重复投递
+    if (typeof replay.seq === 'number' && replay.seq > 0) {
+      replaySeqBySession.set(sessionId, replay.seq)
+      lastEventSeqBySession.set(sessionId, replay.seq)
+    }
+    // 先确保占位与槽位就位（消息列表还没加载完时只登记槽位，
+    // loadMessages 完成后会补建占位并回灌正文/思考）
+    const placeholderId = createStreamPlaceholder(sessionId)
+
+    const blocks = deriveBlocks(events, replay.toolDetails)
+    streamBlocksBySession.value[sessionId] = blocks
+    // 工具卡与 blocks 里的 card 必须是同一批对象：后续 tool_call_update 经
+    // upsertToolCard 原地改属性，时间线上的卡片才会跟着更新
+    const cards: ToolCard[] = []
+    for (const b of blocks) {
+      if (b.kind === 'tool') cards.push(b.card)
+    }
+    activeToolCardsBySession.value[sessionId] = cards
+
+    let reasoning = ''
+    let plan: Plan | null = null
+    for (const e of events) {
+      if (e.type === 'agent_thought' && e.text) {
+        reasoning += e.text
+      } else if (e.type === 'plan' && e.plan) {
+        plan = e.plan // plan 为整体替换语义，取最后一条
+      }
+    }
+    streamReasoningBySession.value[sessionId] = reasoning
+    activePlanBySession.value[sessionId] = plan
+
+    const placeholder = messagesById.value[sessionId]?.find((m) => m.id === placeholderId)
+    if (placeholder) {
+      placeholder.content = joinTextBlocks(blocks)
+      placeholder.reasoning = reasoning
+    }
+  }
+
+  /**
+   * 清除会话的回放序号跟踪（一轮结束/新一轮开始/会话删除时调用）。
+   * 必须按轮清理：后端进程重启后事件序号会从 0 重新发号，跨轮保留旧值会让
+   * 新一轮的回放被误判为「不比本地新」而跳过。
+   */
+  function resetReplayTracking(sessionId: number) {
+    replaySeqBySession.delete(sessionId)
+    lastEventSeqBySession.delete(sessionId)
+  }
+
+  /**
+   * 回放是否包含本端还没见过的内容（seq 比本地已应用的更靠前）。
+   * 切进一个一直在正常收事件的会话时，回放与本地内容一致，重建纯属浪费
+   *（工具卡组件会重新挂载、展开态丢失），此时跳过。
+   * 老后端不带 seq 时无法比较，一律应用（宁可重建一次，不能漏内容）。
+   */
+  function replayIsAhead(sessionId: number, replay: TurnReplay): boolean {
+    const replaySeq = typeof replay.seq === 'number' ? replay.seq : 0
+    if (replaySeq === 0) {
+      return true
+    }
+    return replaySeq > (lastEventSeqBySession.get(sessionId) ?? 0)
+  }
 
   /** 用户选择当前 session 的队首权限选项：回传后移除该请求，继续显示下一项。 */
   function resolvePermission(optionId: string) {
@@ -1359,14 +1583,20 @@ export const useSessionStore = defineStore('session', () => {
   /** turn 收尾：复位指定会话的流式状态（幂等；排队取消/正常结束/出错共用） */
   function endStreamTurn(sessionId: number) {
     statusBySession.value[sessionId] = 'idle'
+    // 清空槽位前冻结：占位消息可能还留在列表里（出错/取消轮后端没落 assistant，
+    // 合并逻辑才会丢弃它），冻结后它继续显示本轮已产出的内容，
+    // 且不会在下一轮开始时把新一轮的实时块渲染出来。
+    freezeStreamBlocks(sessionId)
     delete streamMsgIdBySession.value[sessionId]
     delete streamUserIdBySession.value[sessionId]
     streamBlocksBySession.value[sessionId] = []
+    streamReasoningBySession.value[sessionId] = ''
     activeToolCardsBySession.value[sessionId] = []
     activePlanBySession.value[sessionId] = null
     delete pendingPermissionsBySession.value[sessionId]
     runningSessionIds.value.delete(sessionId)
     lastEventAtBySession.delete(sessionId)
+    resetReplayTracking(sessionId)
     // 出错/保险丝收尾同样接力 steer 队列（用户排队的消息不因一次异常被吞掉；
     // 取消路径已在 cancelSend 清空队列，这里不会误发）
     flushSteerQueue(sessionId)
@@ -1427,27 +1657,54 @@ export const useSessionStore = defineStore('session', () => {
   }
 
   /**
-   * 刷新/重连后的续流扫描：对「最近活跃（updatedAt 距今 < RESYNC_ACTIVE_WINDOW_MS）」
-   * 的会话发 resync，由服务端裁决其 ACP turn 是否仍在执行：
-   * - running=true  → 恢复 streaming + 订阅，后半段实时续流（收尾时落库补全）；
-   * - running=false → 已结束，列表本身是 DB 全量，无需额外动作。
-   * 只扫描第一轮：断线重连场景由 P0 保险丝兜底，重复扫描无意义。
+   * 续流扫描：发 resync 让服务端裁决各会话的 ACP turn 是否仍在执行，
+   * 同时**恢复本连接对该会话的订阅**：
+   * - running=true  → 恢复 streaming + 回放本轮已产出的事件，继续实时续流；
+   * - running=false → 已结束（可能在断线期间就结束），走收尾把落库结果补齐。
+   *
+   * 必须每次连接建立后都跑，不能只跑第一次：后端订阅是**连接级**的
+   *（hub.go Client.subscribed，连接关闭即失效），重连后新连接不订阅任何会话，
+   * 所有广播都投不过来——表现为「connect lost 一闪而过之后页面再也不更新，
+   * 只能整页刷新」。
+   *
+   * 扫描范围 = 本端认为在跑的会话（不受活跃窗口限制：长任务可能几十分钟没有
+   * 落库，updatedAt 早超出窗口，但它恰恰最需要恢复订阅）+ 最近活跃的会话。
    */
-  let resyncScanned = false
-  function rescanRunningSessions() {
-    if (resyncScanned) {
+  /**
+   * 对单个会话发 resync：恢复本连接对它的订阅 + 让服务端裁决是否仍在执行
+   *（仍在执行时随响应带回本轮事件回放）。连接未就绪时静默跳过——
+   * 连接建立后的整轮扫描会补上。
+   */
+  function resyncSession(session: ChatSession | null | undefined) {
+    if (!session?.acpSessionId) {
       return
     }
-    resyncScanned = true
+    acpSocket.send({
+      type: 'resync',
+      sessionId: session.acpSessionId,
+      agentId: session.agentId,
+    })
+  }
+
+  function resyncSessions() {
     const cutoff = Date.now() - RESYNC_ACTIVE_WINDOW_MS
+    const sent = new Set<number>()
+    const sendResync = (s: ChatSession | undefined) => {
+      if (!s?.acpSessionId || sent.has(s.id)) {
+        return
+      }
+      sent.add(s.id)
+      resyncSession(s)
+    }
+    for (const sid of runningSessionIds.value) {
+      // 草稿不在 sessions 列表里，回退到发送时快照（sentSessions）
+      sendResync(sessions.value.find((x) => x.id === sid) ?? sentSessions.get(sid))
+    }
     for (const s of sessions.value) {
       if (new Date(s.updatedAt).getTime() < cutoff) {
         continue
       }
-      if (!s.acpSessionId) {
-        continue
-      }
-      acpSocket.send({ type: 'resync', sessionId: s.acpSessionId, agentId: s.agentId })
+      sendResync(s)
     }
   }
 
@@ -1458,6 +1715,14 @@ export const useSessionStore = defineStore('session', () => {
     // loadMessageUpdates 仍按快照命中本轮占位，且 finally 不会误清新轮的流式槽位。
     const placeholderId = streamMsgIdBySession.value[sessionId]
     const placeholderUserId = streamUserIdBySession.value[sessionId]
+    // 同一轮的收尾去重：turn.done 与 resync 裁决（重连/进入会话）可能几乎同时到达，
+    // 两次 refreshAfterTurn 会用同一个 afterId 各拉一遍增量，把本轮 user 消息插两遍。
+    // 按「会话 + 占位」去重而不是按会话：不同轮次的收尾必须各自执行。
+    const inflightKey = `${sessionId}:${placeholderId ?? 'none'}`
+    if (refreshInFlight.has(inflightKey)) {
+      return
+    }
+    refreshInFlight.add(inflightKey)
     // 登记在途占位：连发竞态时其它轮次的合并（可能先执行）凭此保留本占位不误丢
     if (placeholderId !== undefined) {
       pendingFinalizePlaceholders.add(placeholderId)
@@ -1490,16 +1755,26 @@ export const useSessionStore = defineStore('session', () => {
       // 仅当「本轮占位仍是当前占位」时清理——若异步窗口内用户已发新消息，
       // streamMsgIdBySession 已指向新轮占位，本次收尾是旧轮，不得清掉新轮的槽位。
       if (streamMsgIdBySession.value[sessionId] === placeholderId) {
+        // 失败路径（增量拉取报错）下占位不会转正、仍留在列表里：冻结其内容，
+        // 避免清空槽位后气泡里的文字与工具卡瞬间消失（成功路径已转正，冻结无副作用）。
+        freezeStreamBlocks(sessionId)
         delete streamMsgIdBySession.value[sessionId]
         delete streamUserIdBySession.value[sessionId]
         streamBlocksBySession.value[sessionId] = []
+        streamReasoningBySession.value[sessionId] = ''
         activeToolCardsBySession.value[sessionId] = []
         activePlanBySession.value[sessionId] = null
+        // 本轮已收尾：回放序号跟踪随之失效（后端重启后序号会重新发号，
+        // 跨轮保留会让新一轮的回放被误判为「不比本地新」而跳过）
+        resetReplayTracking(sessionId)
       }
+      // 占位转正/丢弃后其冻结快照即为垃圾，随本次列表重建一并回收
+      pruneFrozenBlocks(sessionId)
       // 注销在途占位登记（无论成功失败）
       if (placeholderId !== undefined) {
         pendingFinalizePlaceholders.delete(placeholderId)
       }
+      refreshInFlight.delete(inflightKey)
       // 本轮已收尾：接力发送 steer 队列里的下一条（响应过程中发送的消息）
       flushSteerQueue(sessionId)
     }
@@ -1529,6 +1804,14 @@ export const useSessionStore = defineStore('session', () => {
           const e = msg.event
           if (!e || sid === null) {
             break
+          }
+          // 回放幂等：该事件已包含在 resync 回放快照里，只是广播晚于回放到达，
+          // 再追加一次就会重复渲染（见 replaySeqBySession）
+          if (e.seq !== undefined && e.seq <= (replaySeqBySession.get(sid) ?? 0)) {
+            break
+          }
+          if (e.seq !== undefined && e.seq > (lastEventSeqBySession.get(sid) ?? 0)) {
+            lastEventSeqBySession.set(sid, e.seq)
           }
           // 排队 → 流式兜底：正常由 turn.started 切换；此处兜底旧后端或
           // 广播丢失场景——收到本会话事件说明 agent 已开始处理
@@ -1628,21 +1911,40 @@ export const useSessionStore = defineStore('session', () => {
           break
         }
         case 'session.resynced': {
-          // 刷新/重连后的续流裁决（sid 已在此前统一解析；sessionId 为 ACP id）：
-          // running=true 且当前无人主动操作（idle）→ 恢复 streaming + 占位，
-          // 后续事件继续实时追加；running=false 说明会话已结束，列表本就是
-          // DB 全量，无需额外动作；用户已发新消息（非 idle）时不覆盖其状态。
+          // 刷新/重连后的续流裁决（sid 已在此前统一解析；sessionId 为 ACP id）。
           if (sid === null) {
             break
           }
-          if (msg.running && statusOf(sid) === 'idle') {
+          // 时效保护：本地刚发出新 prompt 时，本响应描述的是发送前的状态，整体忽略。
+          // 否则可能把上一轮的回放快照盖到新一轮的占位上，或把新轮误判为已结束
+          //（该 resync 是进入会话/重连时发的，后端处理它时新 prompt 还没到）。
+          if (Date.now() - (lastPromptSentAtBySession.get(sid) ?? 0) < RESYNC_STALE_GUARD_MS) {
+            break
+          }
+          const st = statusOf(sid)
+          if (msg.running) {
+            // 后端裁决仍在执行：恢复/保持 streaming，并用回放对齐本轮已产出的内容。
+            // 回放对两种场景都成立——刷新（本地什么都没有）与重连（断线期间漏了
+            // 事件），它是本轮的完整快照，整体替换本地增量即可，不会重复渲染。
+            // cancelling 例外：用户已点停止，不把状态拉回 streaming（等 turn.done 收尾）。
+            if (st === 'cancelling') {
+              break
+            }
             statusBySession.value[sid] = 'streaming'
             runningSessionIds.value.add(sid)
+            lastEventAtBySession.set(sid, Date.now())
+            if (msg.replay && replayIsAhead(sid, msg.replay)) {
+              restoreStreamFromReplay(sid, msg.replay)
+            }
             createStreamPlaceholder(sid)
-          } else if (statusOf(sid) === 'idle' && streamMsgIdBySession.value[sid] !== undefined) {
-            // 竞态：事件先于 resync 响应到达时兜底建了占位，但后端裁决已结束
-            //（turn 恰在此刻收尾）。走一次收尾：增量拉取把已落库结果补全，
-            // 无落库则清理残留占位，避免空白气泡。
+            break
+          }
+          // running=false：后端已无本轮。
+          // - 本地还认为在跑（streaming/queued/cancelling）→ turn 在断线/刷新期间
+          //   就结束了，turn.done 永远不会再来：必须走收尾，否则永久卡在「正在执行」
+          //  （占位不转正、停止按钮不消失、侧栏圆点长亮）；
+          // - 本地 idle 但残留占位 → 事件先于 resync 响应到达的竞态，同样收尾清理。
+          if (st !== 'idle' || streamMsgIdBySession.value[sid] !== undefined) {
             void finalizeStream(sid)
           }
           break
@@ -1651,8 +1953,7 @@ export const useSessionStore = defineStore('session', () => {
           // 收尾目标：优先按广播 sessionId 路由；解析失败（如执行中 agent 重启、
           // recoverSession 换了新 ACP id，索引尚未更新）时回退「唯一运行中会话」——
           // 多会话并行时无法区分则丢弃，避免误复位
-          const target =
-            sid ?? (runningSessionIds.value.size === 1 ? [...runningSessionIds.value][0] : null)
+          const target = sid ?? fallbackRunningSid()
           if (target === null) {
             break
           }
@@ -1665,24 +1966,54 @@ export const useSessionStore = defineStore('session', () => {
         }
         case 'permission.request': {
           // 权限请求按 DB session id 入队：后台 session 的请求不会覆盖当前窗口。
-          if (sid !== null && statusOf(sid) === 'queued') {
-            statusBySession.value[sid] = 'streaming'
+          // 路由失败时用「唯一运行中会话」兜底：权限请求丢了就再也补不回来
+          //（agent 会一直阻塞到 5 分钟超时自动取消），比串台风险更需要兜住。
+          const target = sid ?? fallbackRunningSid()
+          if (target === null) {
+            break
           }
-          if (sid !== null) {
-            const queue = pendingPermissionsBySession.value[sid] ?? (pendingPermissionsBySession.value[sid] = [])
-            queue.push({
-              sessionId: sid,
-              permissionId: msg.permissionId ?? '',
-              toolCall: msg.toolCall ?? null,
-              options: msg.options ?? [],
-            })
+          if (statusOf(target) === 'queued') {
+            statusBySession.value[target] = 'streaming'
+          }
+          const queue =
+            pendingPermissionsBySession.value[target] ??
+            (pendingPermissionsBySession.value[target] = [])
+          const permissionId = msg.permissionId ?? ''
+          // 去重：resync 补发（重连/刷新）可能与仍在队列里的同一请求撞上，
+          // 重复入队会让用户点两次才关得掉弹窗
+          if (permissionId && queue.some((p) => p.permissionId === permissionId)) {
+            break
+          }
+          queue.push({
+            sessionId: target,
+            permissionId,
+            toolCall: msg.toolCall ?? null,
+            options: msg.options ?? [],
+          })
+          break
+        }
+        case 'permission.resolved': {
+          // 请求已失效（用户在别的标签页选过，或后端等待超时自动取消）：
+          // 从队列移除，撤下弹窗，避免用户对着一个不会生效的选择框点击。
+          const target = sid ?? fallbackRunningSid()
+          if (target === null || !msg.permissionId) {
+            break
+          }
+          const queue = pendingPermissionsBySession.value[target]
+          if (!queue) {
+            break
+          }
+          const rest = queue.filter((p) => p.permissionId !== msg.permissionId)
+          if (rest.length === 0) {
+            delete pendingPermissionsBySession.value[target]
+          } else {
+            pendingPermissionsBySession.value[target] = rest
           }
           break
         }
         case 'error': {
           // 出错同样结束本轮；错误只写入目标 session，避免后台错误串到当前窗口。
-          const target =
-            sid ?? (runningSessionIds.value.size === 1 ? [...runningSessionIds.value][0] : null)
+          const target = sid ?? fallbackRunningSid()
           if (target !== null) {
             endStreamTurn(target)
             setSessionStreamError(target, msg.message ?? msg.code ?? 'unknown error')
@@ -1829,6 +2160,24 @@ export const useSessionStore = defineStore('session', () => {
       throw new Error('session has no acp session id')
     }
 
+    // 新一轮开始：先冻结上一轮尚未转正的占位内容，再清空会话级流式槽位，
+    // 最后才建本轮占位。顺序不能反，原因有二：
+    // 1) turn.done 后状态机先回 idle（endStreamTurnSoft），槽位却要等
+    //    refreshAfterTurn 的 finally（中间隔着几次 HTTP 请求）才释放。用户在这个
+    //    窗口里发送时，若不清槽位，createStreamPlaceholder 会命中「槽位已有且占位
+    //    仍在列表」直接复用上一轮占位：本轮回复被渲染到刚发出的用户消息**之前**
+    //    （看起来像新消息插进了上一轮回复中间），随后旧轮 finally 发现槽位 id
+    //    未变又把槽位删掉，剩余事件另建占位，同一条回复被劈成两段。
+    // 2) 冻结保证上一轮占位在转正前继续显示自己的内容，而不是跟着渲染本轮实时块。
+    freezeStreamBlocks(sessionId)
+    delete streamMsgIdBySession.value[sessionId]
+    delete streamUserIdBySession.value[sessionId]
+    streamBlocksBySession.value[sessionId] = []
+    streamReasoningBySession.value[sessionId] = ''
+    activeToolCardsBySession.value[sessionId] = []
+    activePlanBySession.value[sessionId] = null
+    resetReplayTracking(sessionId)
+
     // 乐观展示用户消息 + 空占位（流式追加目标；createStreamPlaceholder 统一占位
     // 创建，与 resync 续流共用同一套「槽位 + 列表落点」语义）
     const userMsg = appendLocal(sessionId, 'user', content)
@@ -1839,9 +2188,6 @@ export const useSessionStore = defineStore('session', () => {
     // 后广播 turn.started；事件/permission.request 兜底切换，保证不会卡在 queued。
     statusBySession.value[sessionId] = 'queued'
     clearSessionStreamError(sessionId)
-    streamBlocksBySession.value[sessionId] = []
-    activeToolCardsBySession.value[sessionId] = []
-    activePlanBySession.value[sessionId] = null
     // 快照发送用会话：cancel 帧需要 acpSessionId（草稿不在 sessions 列表）
     sentSessions.set(sessionId, session)
     indexAcpSession(session)
@@ -1860,6 +2206,8 @@ export const useSessionStore = defineStore('session', () => {
       // 发送成功即视为「任务进行中」，点亮侧栏圆点；同时初始化保险丝静默计时
       runningSessionIds.value.add(sessionId)
       lastEventAtBySession.set(sessionId, Date.now())
+      // 记录发送时刻：晚于此刻发出的 resync 裁决才对本轮有效（见 RESYNC_STALE_GUARD_MS）
+      lastPromptSentAtBySession.set(sessionId, Date.now())
     }
   }
 
@@ -1914,16 +2262,36 @@ export const useSessionStore = defineStore('session', () => {
   setInterval(() => {
     void checkStalledTurns()
   }, TURN_FUSE_INTERVAL_MS)
-  // 刷新/重连后的续流恢复：WS 建立且会话列表就绪后，对最近活跃会话发 resync
-  // （服务端裁决是否仍在执行；只扫一轮，见 rescanRunningSessions）
+  // 刷新/重连后的续流恢复：**每次**连接建立都重新 resync（服务端裁决是否仍在执行、
+  // 恢复本连接订阅、回放本轮已产出的事件），不是「只扫一轮」，见 resyncSessions。
+  let resyncWaitingForSessions = false
   watch(
-    [() => acpSocket.state.status, () => sessions.value.length],
-    ([status, sessionCount]) => {
-      if (status === 'open' && sessionCount > 0) {
-        rescanRunningSessions()
+    () => acpSocket.state.status,
+    (status) => {
+      if (status !== 'open') {
+        return
       }
+      // 会话列表按项目懒加载：连接就绪时可能还是空的，等列表加载出来后补扫
+      if (sessions.value.length === 0) {
+        resyncWaitingForSessions = true
+        return
+      }
+      resyncWaitingForSessions = false
+      resyncSessions()
+      // 立刻跑一次保险丝：断线期间可能漏掉 turn.done，不必等 60s 轮询周期
+      //（首次建连时 runningSessionIds 还是空的，这里是空转，无副作用）
+      void checkStalledTurns()
     },
     { immediate: true },
+  )
+  watch(
+    () => sessions.value.length,
+    (count) => {
+      if (count > 0 && resyncWaitingForSessions && acpSocket.state.status === 'open') {
+        resyncWaitingForSessions = false
+        resyncSessions()
+      }
+    },
   )
 
   return {
@@ -1947,6 +2315,7 @@ export const useSessionStore = defineStore('session', () => {
     statusOf,
     turnCountOf,
     streamBlocksOf,
+    placeholderBlocksOf,
     activeToolCardsOf,
     activePlanOf,
     isStreamingMessage,

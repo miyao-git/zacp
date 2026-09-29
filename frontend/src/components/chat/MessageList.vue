@@ -8,15 +8,16 @@ import { useAppStore } from '@/stores/app'
 import { useChatScroll } from '@/composables/useChatScroll'
 import MessageItem from '@/components/chat/MessageItem.vue'
 import MessageNavRail from '@/components/chat/MessageNavRail.vue'
-import PermissionModal from '@/components/chat/PermissionModal.vue'
 
 const { t } = useI18n()
 const sessionStore = useSessionStore()
 const appStore = useAppStore()
 
 const scroller = ref<HTMLElement | null>(null)
+/** 内容容器（高度随流式输出增长）：交给 useChatScroll 的 ResizeObserver 跟随异步撑高 */
+const content = ref<HTMLElement | null>(null)
 const { atBottom, onScroll, scrollToBottom, snapToBottom, followIfAtBottom } =
-  useChatScroll(scroller)
+  useChatScroll(scroller, content)
 
 /**
  * 消息列表变化信号：长度（追加/刷新）、最后一条内容（流式追加）、思考文本（reasoning）、
@@ -50,34 +51,27 @@ function onRetryMessages() {
   }
 }
 
-/**
- * 切换会话待吸附标记：消息历史是异步加载的（loadMessages 完成后才渲染），
- * currentId 变化时直接滚动往往发生在消息渲染前（空列表），需等列表变化后再贴底。
- */
-let pendingSnapToBottom = false
-
+/** 消息内容变化：跟随中则贴底（异步渲染撑高由 useChatScroll 的 ResizeObserver 兜住） */
 watch(messageTick, () => {
-  void nextTick(() => {
-    if (pendingSnapToBottom) {
-      // 新会话消息渲染完成：无条件贴底，并复位标记（之后恢复「贴底才跟随」策略）
-      pendingSnapToBottom = false
-      scrollToBottom()
-    } else {
-      followIfAtBottom()
-    }
-  })
+  void nextTick(() => followIfAtBottom())
 })
 
-/** 切换会话：先尝试立即贴底（缓存命中时本 tick 已渲染），并标记等待异步消息加载 */
+/**
+ * 切换会话：无条件贴底并恢复跟随。
+ *
+ * 消息历史是异步加载的，此刻列表可能还是上一个会话的（或空的）——贴底动作由
+ * 随后的 messageTick 与 ResizeObserver 在新内容渲染出来后继续补齐，
+ * 这里的关键作用是把 atBottom 置回 true：从「正在输出的会话」切走再切回时，
+ * 若不复位跟随意图，页面会停在切走时的位置，不再跟随后续输出。
+ */
 watch(
   () => sessionStore.currentId,
   (id) => {
     if (id === null) {
-      pendingSnapToBottom = false
       return
     }
-    pendingSnapToBottom = true
-    void nextTick(() => scrollToBottom())
+    snapToBottom()
+    void nextTick(() => snapToBottom())
   },
 )
 
@@ -267,7 +261,10 @@ onBeforeUnmount(() => {
            底部额外留白 = 悬浮输入层高度 + 64px（--composer-h 由 ChatPane 实测写入）：
            输入条浮在消息之上，且底部 40px 是渐强模糊的溶解带，最后一条消息要停在
            溶解带之上，不被永久遮住。 -->
-      <div class="content-container flex flex-col gap-4 px-3 pt-6 pb-[calc(var(--composer-h,6rem)_+_4rem)] lg:px-0">
+      <div
+        ref="content"
+        class="content-container flex flex-col gap-4 px-3 pt-6 pb-[calc(var(--composer-h,6rem)_+_4rem)] lg:px-0"
+      >
         <!-- ThemeProvider 把当前主题注入 incremark 渲染上下文：
              驱动 shiki 代码高亮在 github-light / github-dark 之间切换（CSS 层的
              data-theme 属性只影响代码块背景/容器色，token 颜色必须靠这个上下文）。
@@ -314,9 +311,6 @@ onBeforeUnmount(() => {
           </n-text>
         </ThemeProvider>
       </div>
-
-      <!-- 权限请求弹窗（壳层级，挂载在消息列表上即可全局可见） -->
-      <PermissionModal />
     </div>
 
     <!-- 用户消息导航条：折叠态只显示横杠（当前项深色），hover 展开预览并可点击跳转；

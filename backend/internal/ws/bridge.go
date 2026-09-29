@@ -32,7 +32,7 @@ type EventBridge struct {
 	promptOrderMu   sync.Mutex
 	promptOrderTail chan struct{}
 
-	// pendingPermissions 等待前端回传的权限请求（permissionID → 响应通道）。
+	// pendingPermissions 等待前端回传的权限请求（permissionID → *pendingPermission）。
 	// ACP 请求自身带 sessionId，因此多个 session 可独立挂起，不依赖 Agent 的单一当前会话。
 	pendingPermissions sync.Map
 
@@ -50,6 +50,18 @@ type EventBridge struct {
 // 用户消息在入队前就已落库（立即进入对话序列），队列里只保留执行所需文本。
 type queuedPrompt struct {
 	text string
+}
+
+// pendingPermission 一个等待前端回传的权限请求。
+// 除响应通道外还保留会话归属与展示载荷：刷新/重连后 resync 需要把仍未决的请求
+// 重新投递给前端——否则弹窗随旧页面一起消失，agent 会一直阻塞到 permissionTimeout
+// 超时自动取消（用户侧表现为「权限确认弹窗有时候弹不出来」）。
+type pendingPermission struct {
+	id        string
+	ch        chan acp.RequestPermissionResponse
+	sessionID string
+	toolCall  map[string]interface{}
+	options   []map[string]interface{}
 }
 
 // promptQueueKey 会话级队列键：agent + ACP session id 唯一确定一个会话。
@@ -414,9 +426,8 @@ func (b *EventBridge) applySessionInfo(dbSession *model.Session, title string) {
 	b.log.Info("session title updated by agent", "sessionID", sessionID, "title", title)
 }
 
-// handleEvent 处理 ACP 事件并广播到 WebSocket
-func (b *EventBridge) handleEvent(sessionID string, event client.Event) {
-	// 将 ACP 事件转换为 WebSocket 事件
+// eventToWsPayload 把 ACP 事件转成 WS 广播载荷（实时广播与 resync 回放共用同一形状）。
+func eventToWsPayload(event client.Event) map[string]interface{} {
 	wsEvent := map[string]interface{}{
 		"type":   event.Type,
 		"text":   event.Text,
@@ -435,9 +446,178 @@ func (b *EventBridge) handleEvent(sessionID string, event client.Event) {
 	if event.Plan != nil {
 		wsEvent["plan"] = event.Plan
 	}
+	// 事件序号：前端用它做 resync 回放的幂等判定（见 Event.Seq）
+	if event.Seq != 0 {
+		wsEvent["seq"] = event.Seq
+	}
+	return wsEvent
+}
+
+// handleEvent 处理 ACP 事件并广播到 WebSocket
+func (b *EventBridge) handleEvent(sessionID string, event client.Event) {
+	// 将 ACP 事件转换为 WebSocket 事件
+	wsEvent := eventToWsPayload(event)
 
 	// 广播事件到该会话的所有连接
 	b.handler.BroadcastEvent(sessionID, wsEvent)
+}
+
+// maxReplayEvents 回放事件条数上限（瘦身后的条数）。
+// 事件风暴（异常 agent 每秒产出数百条事件）会把本轮缓存顶到上限并持续裁剪，
+// 若无条件全量回放，单个 resync 响应可能有好几 MB：既容易把发送缓冲顶满
+// （进而被踢连接、再 resync、再被踢），也让前端一次性重建海量节点。
+// 超限时只回放**最近的**部分——用户关心的是最新进展，被截断的前半段等本轮
+// 结束落库后由历史消息完整呈现。
+const maxReplayEvents = 400
+
+// maxReplayBytes 回放载荷的体积上限，超出则继续从头部裁剪。
+// 只按条数裁剪挡不住体积：瘦身会把相邻文本块合并成**一条**事件，
+// 事件风暴下这一条就可能有几 MB——一帧发出去足以再次顶满发送缓冲（又被踢连接），
+// 前端也要一次性渲染巨块 markdown。回放只是「恢复现场」，宁可少给前半段
+// （本轮结束落库后由历史消息完整补全），也不能把恢复通道自己压垮。
+const maxReplayBytes = 1 << 20 // 1MB
+
+// buildTurnReplay 把「本轮事件快照」整理成 resync 回放载荷，返回载荷与被截断的事件数。
+//
+// 与落库同一套瘦身（见 pkg/eventstore）：合并相邻文本块（token 级碎片 → 整段）、
+// 工具入参/出参抽到 toolDetails（每工具一份最终值）。回放体积因此与历史消息同量级，
+// 而不是「本轮所有 token 碎片」的原始体积；前端可直接用 deriveBlocks 重建时间线。
+//
+// seq 为快照里的最大事件序号，供前端做幂等判定（丢弃「快照已含、广播却晚到」的
+// 重复事件）。**必须取自原始事件**：瘦身会合并相邻文本块，合并结果只保留首块的
+// seq，用瘦身后的最大值会漏掉被合并进去的那些，重复投递就挡不住了。
+func buildTurnReplay(events []client.Event) (map[string]interface{}, int, int) {
+	var maxSeq uint64
+	for _, ev := range events {
+		if ev.Seq > maxSeq {
+			maxSeq = ev.Seq
+		}
+	}
+	slim, details := eventstore.SplitToolDetails(events)
+	truncated := 0
+	if len(slim) > maxReplayEvents {
+		truncated = len(slim) - maxReplayEvents
+		slim = slim[truncated:]
+		details = filterToolDetails(slim, details)
+	}
+	// 体积兜底：仍超预算就反复对半砍头部（最多 log2(n) 次序列化，resync 本身很稀疏）。
+	// 砍到只剩一条还超（超大工具详情）时丢弃详情：工具卡照常按时间线渲染，
+	// 入参/出参等本轮落库后由历史消息补全。
+	for len(slim) > 1 {
+		if replaySize(slim, details) <= maxReplayBytes {
+			break
+		}
+		keep := len(slim) / 2
+		truncated += len(slim) - keep
+		slim = slim[keep:]
+		details = filterToolDetails(slim, details)
+	}
+	if len(slim) > 0 && replaySize(slim, details) > maxReplayBytes {
+		// 砍到只剩一条仍超预算：体积来自工具详情，直接丢弃详情
+		//（工具卡仍按时间线渲染，入参/出参等本轮落库后由历史消息补全）
+		details = nil
+	}
+	payload := map[string]interface{}{
+		"events":      slim,
+		"toolDetails": details,
+		"seq":         maxSeq,
+	}
+	return payload, truncated, replaySize(slim, details)
+}
+
+// replaySize 估算回放载荷的序列化体积（超限裁剪用）。
+func replaySize(slim []client.Event, details map[string]eventstore.ToolDetail) int {
+	n, _ := json.Marshal(struct {
+		Events  []client.Event                   `json:"events"`
+		Details map[string]eventstore.ToolDetail `json:"toolDetails"`
+	}{slim, details})
+	return len(n)
+}
+
+// filterToolDetails 只保留仍出现在回放事件里的工具详情，
+// 别为已被截断的工具白传大字段。
+func filterToolDetails(slim []client.Event, details map[string]eventstore.ToolDetail) map[string]eventstore.ToolDetail {
+	if len(details) == 0 {
+		return details
+	}
+	kept := make(map[string]bool, len(slim))
+	for _, ev := range slim {
+		if ev.ToolID != "" {
+			kept[ev.ToolID] = true
+		}
+	}
+	out := make(map[string]eventstore.ToolDetail, len(kept))
+	for id, d := range details {
+		if kept[id] {
+			out[id] = d
+		}
+	}
+	return out
+}
+
+// HandleResync 处理前端刷新/重连后的 resync（订阅已由调用方恢复）：回报该会话是否
+// 仍在执行，并把请求方错过的本轮状态一次性补齐：
+//   - 事件回放：client.Bridge 按会话缓存本轮事件（turn 结束即清空），
+//     不回放的话刷新后只能看到「刷新之后」到达的那部分输出；
+//   - 未决权限请求：agent 正阻塞等待用户选择，弹窗已随旧页面消失，必须重新投递。
+//
+// 幂等：push 的「入缓存」与「广播」不是原子的，快照里已包含的事件可能在回放之后
+// 才广播到前端。因此回放带上快照的最大 seq，前端丢弃 seq 不大于它的实时事件
+// （见前端 replaySeqBySession）——不需要为此在广播热路径上加锁。
+//
+// 只投递给发起 resync 的连接，不广播：其它连接的视图是连续的，回放会打断它。
+func (b *EventBridge) HandleResync(c *Client, agentID, sessionID string) {
+	running := b.HasPromptInProgress(agentID, sessionID)
+	msg := ServerMessage{Type: MsgTypeSessionResynced, SessionID: sessionID, Running: running}
+
+	if running && sessionID != "" {
+		bridge, err := b.manager.GetBridge(agentID)
+		if err != nil {
+			// agent 未启动/已重启：本轮缓存不存在，无从回放（前端按 DB 全量渲染）
+			b.log.Warn("resync: agent bridge unavailable, skip replay",
+				"agentID", agentID, "sessionID", sessionID, "err", err)
+		} else if events := bridge.Events(sessionID); len(events) > 0 {
+			replay, truncated, size := buildTurnReplay(events)
+			msg.Replay = replay
+			b.log.Info("resync: replaying in-flight turn",
+				"sessionID", sessionID, "events", len(events), "seq", replay["seq"],
+				"truncated", truncated, "bytes", size)
+		}
+	}
+	c.Send(msg)
+
+	// 补发未决权限请求：agent 正阻塞等待，弹窗却随旧页面一起消失了
+	for _, p := range b.pendingPermissionsFor(sessionID) {
+		// 快照与投递之间可能已被解决（用户在另一个标签页点了）：复查后再发，
+		// 避免弹出一个后端已不认识的请求
+		if _, alive := b.pendingPermissions.Load(p.id); !alive {
+			continue
+		}
+		b.log.Info("resync: re-delivering pending permission",
+			"permissionID", p.id, "sessionID", sessionID)
+		c.Send(ServerMessage{
+			Type:         MsgTypePermissionRequest,
+			SessionID:    sessionID,
+			PermissionID: p.id,
+			ToolCall:     p.toolCall,
+			Options:      p.options,
+		})
+	}
+}
+
+// pendingPermissionsFor 返回指定 ACP 会话上仍未决的权限请求（resync 补发用）。
+func (b *EventBridge) pendingPermissionsFor(sessionID string) []*pendingPermission {
+	if sessionID == "" {
+		return nil
+	}
+	var out []*pendingPermission
+	b.pendingPermissions.Range(func(_, v any) bool {
+		if p, ok := v.(*pendingPermission); ok && p.sessionID == sessionID {
+			out = append(out, p)
+		}
+		return true
+	})
+	return out
 }
 
 // HandlePermissionRequest 处理 agent 的权限请求（在 RequestPermission 回调中同步调用）：
@@ -446,7 +626,6 @@ func (b *EventBridge) handleEvent(sessionID string, event client.Event) {
 func (b *EventBridge) HandlePermissionRequest(agentID string, req acp.RequestPermissionRequest) (acp.RequestPermissionResponse, error) {
 	permissionID := fmt.Sprintf("perm-%d", time.Now().UnixNano())
 	ch := make(chan acp.RequestPermissionResponse, 1)
-	b.pendingPermissions.Store(permissionID, ch)
 
 	sessionID := string(req.SessionId)
 	// 转成前端友好结构（SDK 类型直接序列化字段不稳定，显式挑字段）
@@ -472,6 +651,15 @@ func (b *EventBridge) HandlePermissionRequest(agentID string, req acp.RequestPer
 		})
 	}
 
+	// 登记必须在广播之前：并发到达的 resync 要能看到这个未决请求并补发给新页面
+	b.pendingPermissions.Store(permissionID, &pendingPermission{
+		id:        permissionID,
+		ch:        ch,
+		sessionID: sessionID,
+		toolCall:  toolCall,
+		options:   options,
+	})
+
 	b.handler.BroadcastPermissionRequest(sessionID, permissionID, toolCall, options)
 	b.log.Info("permission requested", "permissionID", permissionID, "sessionID", sessionID)
 
@@ -490,6 +678,8 @@ func (b *EventBridge) HandlePermissionRequest(agentID string, req acp.RequestPer
 	case <-timer.C:
 		b.pendingPermissions.Delete(permissionID)
 		b.log.Warn("permission request timed out", "permissionID", permissionID)
+		// 通知前端撤下弹窗：请求已随超时失效，留着会让用户对着一个不会生效的选择框点击
+		b.handler.BroadcastPermissionResolved(sessionID, permissionID)
 		return acp.RequestPermissionResponse{
 			Outcome: acp.RequestPermissionOutcome{Cancelled: &acp.RequestPermissionOutcomeCancelled{}},
 		}, nil
@@ -504,12 +694,12 @@ func (b *EventBridge) ResolvePermission(permissionID, optionID string) {
 		b.log.Warn("permission not pending", "permissionID", permissionID)
 		return
 	}
-	ch, ok := v.(chan acp.RequestPermissionResponse)
+	pending, ok := v.(*pendingPermission)
 	if !ok {
 		return
 	}
 	select {
-	case ch <- acp.RequestPermissionResponse{
+	case pending.ch <- acp.RequestPermissionResponse{
 		Outcome: acp.RequestPermissionOutcome{
 			Selected: &acp.RequestPermissionOutcomeSelected{OptionId: acp.PermissionOptionId(optionID)},
 		},
@@ -517,6 +707,8 @@ func (b *EventBridge) ResolvePermission(permissionID, optionID string) {
 	default:
 		// 通道已满（理论上不会），丢弃
 	}
+	// 广播「已决」：同一会话可能开在多个标签页/窗口，其它连接的弹窗必须同步撤下
+	b.handler.BroadcastPermissionResolved(pending.sessionID, permissionID)
 }
 
 // deriveTitle 从首条用户消息生成会话标题（最多 24 个字符）
