@@ -15,6 +15,8 @@ export default {
     newSession: '新建会话',
     removeProject: '移除',
     removeProjectConfirm: '移除项目「{name}」？其下会话将隐藏，再次添加同路径可整体恢复',
+    dragProject: '拖动排序',
+    reorderFailed: '排序保存失败，已恢复',
     sessionGroup: '会话',
     noSessions: '暂无会话',
     noSessionsHint: '点击「新建项目」添加项目',

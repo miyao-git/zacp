@@ -60,19 +60,23 @@ cd ~/prj/zacp && ./scripts/build.sh
 
 ## 3. 已完成的本地改动（截至 2026-09-29）
 
-**已提交**（`155e0b2` / `2976e11` / `7758bdb`）：
+**已提交**（`155e0b2` / `2976e11` / `7758bdb` / `80c1597` / `c697d01`）：
 
 1. `frontend/src/stores/session.ts`：`MAX_WORKSPACES` 10 → 50（"新建项目"前端上限；后端本就无限制，此前因导入的历史工作区超过 10 个被拦）
 2. `backend/internal/service/service.go`：`cleanupAgentSession` 先 `EnsureStarted` —— agent 被空闲回收或服务重启后，删除会话也能传播到 agent 侧（此前静默失败、会话数据残留）
 3. `backend/internal/acp/manager/manager.go`：`IsUnknownSessionErr` 增加整短语 `invalid session identifier` 识别 —— qodercli 对「磁盘上也不存在的会话」的报错措辞，此前归类失败导致降级
-
-**未提交**：
-
 4. `backend/cmd/server/main.go`：agent 预热改异步 —— 此前同步等待 qodercli 的 ACP 握手（实测 ~4.3s），HTTP 监听从 ~66ms 被拖到 ~4.4s；改为后台预热后启动恢复 ~66ms，空态/建会话由 `EnsureStarted` 幂等兜底
 5. `AGENTS.md` 与本文件的 WebUI 迭代注意事项（见 §2）
    （仓库外）`~/.zacp/tools/deploy-zacp.sh`：新增 `--build-only`、独立会话重启器、健康检查轮询
 
-已验证：杀 agent 确认 → 网页删除 → qodercli 会话文件自动删除（进程被按需拉起）；无效会话删除无降级告警；启动耗时隔离环境实测 4446ms → 66ms，真实服务重启健康检查通过。
+**未提交**：
+
+6. **项目手动排序（后端持久化）+ 会话状态点常驻**：
+   - 后端：`workspaces` 新增 `sort_order`（迁移 v7 按「最近会话时间 → last_used → id」回填 0..n-1，含软删除行；升级后侧栏顺序与升级前一致）；`List` 改按 `sort_order ASC, id ASC`；新增 `PUT /api/v1/workspaces/order` 批量排序（返回权威完整列表）；新建项目取全域 `MIN-1` = 排最上，恢复（同路径再加）回原位
+   - 前端：`SidebarSessionList` 分组顺序**完全跟随 workspaces**（不再由会话活跃度推导，消除「点开项目/聊天即跳位」）；项目头新增拖拽手柄（手写 pointer 事件：6px 阈值、项目头中点判定落点、零高度绝对定位指示线、边缘自动滚动、Esc 取消、失败提示回滚）；`SessionListItem` 状态点常驻（非活跃 = 浅灰 `idle-dot`，亮色 slate-300 / 暗色 slate-600）；`firstWorkspace` 改为 workspaces[0]（首页守卫与侧栏第一个分组同口径）
+   - 已验证（headless Chrome + CDP 端到端）：拖拽到首位/中间/末尾、刷新保持、后端持久化一致、点击项目头展开折叠不回归、手柄单击不误触发、暗色浅灰点；后端隔离实例验证迁移回填 == 旧侧栏顺序、重排/超出范围 id 容错、重启不重放迁移
+
+（前批改动验证记录：杀 agent 确认 → 网页删除 → qodercli 会话文件自动删除（进程被按需拉起）；无效会话删除无降级告警；启动耗时隔离环境实测 4446ms → 66ms，真实服务重启健康检查通过。）
 
 ## 4. 与 qodercli 的会话同步（重要背景）
 
@@ -89,6 +93,7 @@ cd ~/prj/zacp && ./scripts/build.sh
 - 前端 assistant 消息**完全由 `events` 时间线渲染**（`agent_message` / `agent_thought` / `tool_call`），`content` 只用于 user 气泡与全文兜底；工具详情在 `toolDetails`（`{toolId: {input, output}}`）
 - `eventstore.ContainsThought` 是**子串匹配** `"type":"agent_thought"`（紧凑 JSON、冒号后无空格）——任何写 `events` 的代码必须用 `json.Marshal` 风格序列化，否则思考过程接口会静默失效
 - workspace 路径 = 会话恢复时的 cwd；worktree 会话归组展示后，恢复用仓库目录（qodercli 的 load 会搜 same-repo worktrees，能找到）
+- 脚本**直写 `workspaces` 表**（第 376-383 行裸 INSERT）：v7 迁移新增 `sort_order` 列后，INSERT 不写该列会取 `DEFAULT 0`（排序落在手排第一项之后，不报错）。若要让导入的新项目排最上，INSERT 加一列 `sort_order`，取值 `(SELECT COALESCE(MIN(sort_order),0)-1 FROM workspaces)`（脚本待改，见 §6）
 
 **zacp 恢复链路**：prompt / config-options → `IsUnknownSessionErr` → `RecoverSession`：优先 `session/load`（历史回放被 `mutedSessions` 静音、不重复入库），失败 `session/new` 重建 + 回放配置。
 
@@ -108,6 +113,7 @@ cd ~/prj/zacp && ./scripts/build.sh
 5. `MAX_WORKSPACES` 改为配置项（现为前端常量）
 6. 定时同步（cron 调 `import-qoder-history.py`）
 7. 把同步脚本收编进仓库（做成正式功能/面板）
+8. `import-qoder-history.py` 建工作区时补写 `sort_order`（见 §4 耦合点；不改则新导入项目落在手排第一项之后）
 
 ## 7. 已完成的验证记录（回归参考）
 

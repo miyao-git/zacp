@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"errors"
 	"net/http"
 	"strconv"
 
@@ -99,4 +100,37 @@ func (h *WorkspaceHandler) DeleteWorkspace(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusNoContent, nil)
+}
+
+// ReorderWorkspaces 保存侧栏项目手动排序（拖拽落点后调用）
+// PUT /api/v1/workspaces/order
+//
+// 请求体 {"ids":[3,1,2]}（侧栏当前可见项目的完整顺序）；
+// 成功返回与 GET /workspaces 同构的完整列表，客户端据此对齐本地乐观顺序。
+func (h *WorkspaceHandler) ReorderWorkspaces(c *gin.Context) {
+	var req struct {
+		IDs []uint `json:"ids" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": gin.H{"code": "invalid_request", "message": err.Error()},
+		})
+		return
+	}
+
+	workspaces, err := h.svc.ReorderWorkspaces(req.IDs)
+	if err != nil {
+		status := http.StatusInternalServerError
+		code := "reorder_workspaces_failed"
+		if errors.Is(err, service.ErrInvalidArgument) {
+			status = http.StatusBadRequest
+			code = "invalid_request"
+		}
+		c.JSON(status, gin.H{
+			"error": gin.H{"code": code, "message": err.Error()},
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"workspaces": workspaces})
 }

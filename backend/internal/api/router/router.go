@@ -105,6 +105,9 @@ func New(
 			// 工作目录管理
 			authed.GET("/workspaces", workspaceHandler.ListWorkspaces)
 			authed.POST("/workspaces", workspaceHandler.CreateWorkspace)
+			// 保存侧栏手动排序（静态段 order 与 PUT 树的 :id/files/content 同层共存，
+			// gin v1.12 静态优先匹配，不会落到 :id）
+			authed.PUT("/workspaces/order", workspaceHandler.ReorderWorkspaces)
 			authed.GET("/workspaces/:id", workspaceHandler.GetWorkspace)
 			authed.DELETE("/workspaces/:id", workspaceHandler.DeleteWorkspace)
 

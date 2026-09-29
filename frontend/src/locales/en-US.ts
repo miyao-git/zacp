@@ -16,6 +16,8 @@ export default {
     removeProject: 'Remove',
     removeProjectConfirm:
       'Remove project “{name}”? Its sessions will be hidden and will reappear if you add the same path again',
+    dragProject: 'Drag to reorder',
+    reorderFailed: 'Failed to save order, reverted',
     sessionGroup: 'Sessions',
     noSessions: 'No sessions yet',
     noSessionsHint: 'Click “New project” to add a project',

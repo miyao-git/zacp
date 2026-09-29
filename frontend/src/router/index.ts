@@ -101,14 +101,13 @@ router.beforeEach(async (to) => {
   // 等待首屏数据就绪（幂等：与 AppShell onMounted 的调用复用同一 promise）
   await sessionStore.loadInitial()
 
-  // 必须等最近会话列表加载后再判定：firstWorkspace 依赖 sessions 确定
-  // 「最新活跃项目」，sessions 为空时只会回退到最近添加的项目；
-  // 而整页刷新（切换主机）后守卫先于侧栏组件挂载执行，sessions 初始为空，
-  // 不等待这里永远会落到 /new 而非第一个项目的最近会话（需求 6）。
-  // loadInitial 只拉项目列表（会话按项目懒加载），故此处补一次最近会话加载。
+  // firstWorkspace（= 侧栏第一个项目，用户手排第一）只依赖项目列表，loadInitial
+  // 已就绪；这里补一次最近会话加载是为了下面取「该项目下的最近活跃会话」——
+  // 会话按项目懒加载，且整页刷新（切换主机）后守卫先于侧栏组件挂载执行、
+  // sessions 初始为空，不先拉一次会落到 /new 而非该项目最近的会话（需求 6）。
   await sessionStore.loadSessions().catch(() => {})
 
-  // 「第一个项目」= 侧栏第一个分组（最新会话所在项目；无会话时最近使用），
+  // 「第一个项目」= 侧栏第一个分组（用户手动排序的第一个），
   // 与 SidebarSessionList 分组顺序一致，避免跳到侧栏后面的项目
   const first = sessionStore.firstWorkspace()
   if (!first) {

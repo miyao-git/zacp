@@ -103,6 +103,8 @@ export interface Workspace {
   isDefault: boolean
   /** 归档后侧栏隐藏，数据保留 */
   archived: boolean
+  /** 侧栏手动排序序号（越小越靠前；拖拽排序后由后端持久化回写） */
+  sortOrder: number
   lastUsed: string
   createdAt: string
   updatedAt: string

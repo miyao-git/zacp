@@ -85,12 +85,20 @@ func (s *WorkspaceService) CreateWorkspace(path string) (*model.Workspace, error
 		return restored, nil
 	}
 
+	// 侧栏手动排序：新项目排到最前（MIN-1），与旧版「新建即最前」的观感一致；
+	// 失败不阻塞创建（排序值缺失只影响位置，取 0 由 id 兜底，可后续拖拽调整）。
+	nextSort, err := s.repo.NextSortOrder()
+	if err != nil {
+		slog.Warn("resolve next workspace sort order failed, fallback to 0", "error", err)
+		nextSort = 0
+	}
 	workspace := &model.Workspace{
 		Path: absPath,
 		// 未显式提供 name 时，默认取路径末尾段作为显示名（如 /data/apps/51job → 51job），
 		// 侧栏只展示项目名而非完整路径（见设计文档「项目列表展示」）。
-		Name:     defaultWorkspaceName(absPath),
-		LastUsed: time.Now(),
+		Name:      defaultWorkspaceName(absPath),
+		SortOrder: nextSort,
+		LastUsed:  time.Now(),
 	}
 
 	if err := s.repo.Create(workspace); err != nil {
@@ -109,8 +117,25 @@ func (s *WorkspaceService) GetWorkspace(id uint) (*model.Workspace, error) {
 	return workspace, nil
 }
 
-// ListWorkspaces 列出所有工作目录（按最近使用排序）
+// ListWorkspaces 列出所有工作目录（按用户手动排序序号）
 func (s *WorkspaceService) ListWorkspaces() ([]model.Workspace, error) {
+	return s.repo.List()
+}
+
+// ReorderWorkspaces 保存侧栏项目手动排序（拖拽落点后调用）：
+// ids 为侧栏可见项目的完整顺序，落库后返回排序后的完整列表，
+// 供客户端一次对齐（避免本地乐观顺序与服务端不一致）。
+func (s *WorkspaceService) ReorderWorkspaces(ids []uint) ([]model.Workspace, error) {
+	seen := make(map[uint]bool, len(ids))
+	for _, id := range ids {
+		if seen[id] {
+			return nil, fmt.Errorf("%w: duplicate workspace id %d", ErrInvalidArgument, id)
+		}
+		seen[id] = true
+	}
+	if err := s.repo.Reorder(ids); err != nil {
+		return nil, err
+	}
 	return s.repo.List()
 }
 

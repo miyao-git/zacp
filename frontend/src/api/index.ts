@@ -220,7 +220,7 @@ export async function testProviderModel(
   })
 }
 
-/** GET /api/v1/workspaces — 工作区列表（按最近使用排序） */
+/** GET /api/v1/workspaces — 工作区列表（按用户手动排序序号，同序号按 id 兜底） */
 export async function fetchWorkspaces(): Promise<Workspace[]> {
   const data = await http.get<{ workspaces: Workspace[] }>('/api/v1/workspaces')
   return data.workspaces
@@ -245,6 +245,17 @@ export async function createWorkspace(path: string): Promise<Workspace> {
 /** DELETE /api/v1/workspaces/:id — 移除项目（后端软删除；同路径再次添加时整体恢复） */
 export async function removeWorkspace(workspaceId: number): Promise<void> {
   await http.delete(`/api/v1/workspaces/${workspaceId}`)
+}
+
+/**
+ * PUT /api/v1/workspaces/order — 保存项目手动排序（侧栏拖拽落点后调用）。
+ * ids 为侧栏可见项目的完整顺序；返回排序后的完整列表（权威顺序，客户端据此对齐）。
+ */
+export async function reorderWorkspaces(ids: number[]): Promise<Workspace[]> {
+  const data = await http.put<{ workspaces: Workspace[] }>('/api/v1/workspaces/order', {
+    body: { ids },
+  })
+  return data.workspaces
 }
 
 /**

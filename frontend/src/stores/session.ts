@@ -7,6 +7,7 @@ import {
   deleteDraftSession as apiDeleteDraftSession,
   renameSession as apiRenameSession,
   removeWorkspace as apiRemoveWorkspace,
+  reorderWorkspaces as apiReorderWorkspaces,
   fetchConfigOptions,
   fetchMessageUpdates,
   fetchMessages,
@@ -431,7 +432,7 @@ export const useSessionStore = defineStore('session', () => {
   /** 兼容导出：当前会话是否正在流式输出 */
   const streaming = computed<boolean>(() => currentStatus.value === 'streaming')
 
-  /** 默认工作区：isDefault 优先，否则最近使用（侧栏分组兜底） */
+  /** 默认工作区：isDefault 优先，否则侧栏第一个（用户手排第一） */
   function defaultWorkspace(): Workspace | undefined {
     return workspaces.value.find((w) => w.isDefault) ?? workspaces.value[0]
   }
@@ -445,26 +446,14 @@ export const useSessionStore = defineStore('session', () => {
   }
 
   /**
-   * 侧栏展示的「第一个项目」：与 SidebarSessionList 分组顺序保持一致。
-   * 分组顺序 = sessions 按 updatedAt 倒序遍历，首个能解析出有效 workspace
-   * 的会话所属项目（最新会话所在项目排最前）；全部项目都无会话时回退
-   * workspaces 列表首个（最近使用）。
+   * 侧栏展示的「第一个项目」= 侧栏第一个分组（用户手动排序的第一个）。
+   * 首页守卫（/ 的自动跳转）必须与侧栏顺序同口径，避免跳到侧栏后面的项目。
    *
-   * 首页守卫跳转必须用它而不是 workspaces[0]：workspace.last_used 只在
-   * 创建/恢复项目时更新（聊天不 touch），workspaces[0] 是「最近添加的项目」，
-   * 与侧栏第一个分组（最新活跃项目）可能不一致，会导致守卫跳到侧栏后面的项目。
+   * 注意：顺序只来自 workspaces（后端 sort_order），不依赖会话活跃度——
+   * 历史实现从 sessions 推导「最新活跃项目」，导致「点开项目（懒加载会话）
+   * 或聊天触发 touch 就整列表跳位」，已废弃。
    */
   function firstWorkspace(): Workspace | undefined {
-    for (const s of sessions.value) {
-      // 与侧栏分组同一套 workspace 解析：软删除 workspace 的会话
-      // （workspace 为空对象/id=0）跳过，不参与「第一个项目」判定
-      const ws = s.workspace?.id
-        ? s.workspace
-        : workspaces.value.find((w) => w.id === s.workspaceId)
-      if (ws) {
-        return ws
-      }
-    }
     return workspaces.value[0]
   }
 
@@ -507,6 +496,32 @@ export const useSessionStore = defineStore('session', () => {
       }
     })
     await loadWorkspaces()
+  }
+
+  /**
+   * 保存项目手动排序（侧栏拖拽落点后调用）：
+   * 先用传入顺序本地乐观重建（拖拽落点后侧栏立即生效，不等网络），
+   * 再调接口并用后端返回的权威完整列表覆盖（同序号兜底/并发变更一次对齐）；
+   * 失败回滚本地顺序并抛错（由侧栏提示）。
+   *
+   * 不变量：workspaces 数组顺序 = 侧栏分组顺序（SidebarSessionList 完全按它分组），
+   * 排序只改顺序、不触碰会话数据（组内仍按会话活跃度排）。
+   */
+  async function reorderWorkspaces(orderedIds: number[]) {
+    const prev = workspaces.value
+    const byId = new Map(prev.map((w) => [w.id, w]))
+    const optimistic = orderedIds
+      .map((id) => byId.get(id))
+      .filter((w): w is Workspace => w !== undefined)
+    if (optimistic.length > 0) {
+      workspaces.value = optimistic
+    }
+    try {
+      workspaces.value = await apiReorderWorkspaces(orderedIds)
+    } catch (e) {
+      workspaces.value = prev
+      throw e
+    }
   }
 
   /**
@@ -1818,6 +1833,7 @@ export const useSessionStore = defineStore('session', () => {
     loadWorkspaces,
     createWorkspace,
     removeWorkspace,
+    reorderWorkspaces,
     loadSessions,
     loadSessionsByWorkspace,
     loadMoreSessionsByWorkspace,

@@ -38,12 +38,13 @@ const isRunning = computed(() => sessionStore.runningSessionIds.has(props.sessio
 /** 当前 session 是否有待处理权限：与普通运行状态使用不同颜色。 */
 const isPermissionPending = computed(() => sessionStore.hasPendingPermission(props.session.id))
 const streamStatus = computed(() => sessionStore.statusOf(props.session.id))
-/** 状态圆点颜色优先级：权限 > 停止中 > 排队 > 执行中。 */
+/** 状态圆点颜色优先级：权限 > 停止中 > 排队 > 执行中 > 空闲（浅灰常驻）。 */
 const statusDotClass = computed(() => {
   if (isPermissionPending.value) return 'permission-dot'
   if (streamStatus.value === 'cancelling') return 'cancelling-dot'
   if (streamStatus.value === 'queued') return 'queued-dot'
-  return 'running-dot'
+  if (streamStatus.value === 'streaming') return 'running-dot'
+  return 'idle-dot'
 })
 const statusDotTitle = computed(() => {
   if (isPermissionPending.value) return t('permission.hint')
@@ -150,12 +151,14 @@ async function onDelete() {
   >
     <div class="flex min-w-0 flex-1 flex-col gap-0.5">
       <div class="flex min-w-0 items-center gap-1.5">
-        <!-- 状态颜色：排队紫色、执行蓝色、权限橙色、停止灰色；悬停显示状态说明 -->
+        <!-- 状态圆点常驻（DOM 稳定，标题不因圆点出现/消失左右位移）：
+             排队紫色、执行蓝色、权限橙色、停止灰色、空闲浅灰静态；
+             仅非空闲态悬停显示状态说明（空闲无 tooltip） -->
         <n-tooltip
-          v-if="isRunning"
           trigger="hover"
           placement="top"
           :theme-overrides="statusTooltipTheme"
+          :disabled="!isRunning"
         >
           <template #trigger>
             <span
@@ -246,10 +249,16 @@ async function onDelete() {
 .running-dot,
 .queued-dot,
 .permission-dot,
-.cancelling-dot {
+.cancelling-dot,
+.idle-dot {
   width: 8px;
   height: 8px;
   border-radius: 9999px;
+}
+
+/* 空闲：浅灰静态常驻（该会话当前无任务，不做视觉打扰） */
+.idle-dot {
+  background: #cbd5e1; /* slate-300 */
 }
 
 /* 执行中：蓝色正常呼吸 */
@@ -289,6 +298,10 @@ html.dark .permission-dot {
 
 html.dark .cancelling-dot {
   background: #cbd5e1; /* slate-300 */
+}
+
+html.dark .idle-dot {
+  background: #475569; /* slate-600 */
 }
 
 @keyframes status-dot-breathe {

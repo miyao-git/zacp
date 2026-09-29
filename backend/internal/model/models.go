@@ -17,7 +17,12 @@ type Workspace struct {
 	// IsDefault 标记是否为 config session.default_cwd 对应的默认工作区。
 	IsDefault bool `gorm:"index;default:false" json:"isDefault"`
 	// Archived 为 true 时侧栏隐藏，数据与下属 Session 仍保留。
-	Archived  bool           `gorm:"index;default:false" json:"archived"`
+	Archived bool `gorm:"index;default:false" json:"archived"`
+	// SortOrder 侧栏项目手动排序序号（越小越靠前；用户拖拽排序持久化，
+	// 见 store.migrateV7 的初始回填）。not null;default:0 保证旧版本/导入脚本
+	// 裸 INSERT 不写该列时取 0 而非 NULL（NULL 在 SQLite ASC 排序会排在所有
+	// 手排序号之前，破坏用户排序）。
+	SortOrder int            `gorm:"not null;default:0" json:"sortOrder"`
 	LastUsed  time.Time      `gorm:"index" json:"lastUsed"` // 最近使用时间
 	CreatedAt time.Time      `json:"createdAt"`
 	UpdatedAt time.Time      `json:"updatedAt"`

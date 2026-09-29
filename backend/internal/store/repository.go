@@ -1,6 +1,7 @@
 package store
 
 import (
+	"fmt"
 	"time"
 
 	"gorm.io/gorm"
@@ -61,11 +62,75 @@ func (r *WorkspaceRepository) Restore(id uint) error {
 		Update("deleted_at", nil).Error
 }
 
-// List 列出所有工作目录（按最近使用排序）
+// List 列出所有工作目录（按用户手动排序序号；同序号按 id 兜底，
+// 保证新建/恢复/软删除并存时顺序稳定）。
 func (r *WorkspaceRepository) List() ([]model.Workspace, error) {
 	var workspaces []model.Workspace
-	err := r.db.Order("last_used DESC").Find(&workspaces).Error
+	err := r.db.Order("sort_order ASC, id ASC").Find(&workspaces).Error
 	return workspaces, err
+}
+
+// NextSortOrder 返回「排到最前」使用的序号（全域 MIN - 1，含软删除行）。
+// 新建项目出现在侧栏最上，与旧版 last_used DESC 下「新建即最前」的观感一致；
+// 取 Unscoped 是为了不让将来恢复的软删除行与新建值相撞。
+func (r *WorkspaceRepository) NextSortOrder() (int, error) {
+	var next int
+	err := r.db.Unscoped().Model(&model.Workspace{}).
+		Select("COALESCE(MIN(sort_order), 0) - 1").
+		Scan(&next).Error
+	if err != nil {
+		return 0, err
+	}
+	return next, nil
+}
+
+// Reorder 保存侧栏手动排序：把有序 id 列表按给定顺序赋 0..n-1。
+//
+// 契约与容错（供多标签页/并发场景）：
+//   - 空列表视为 no-op（绝不能理解为「全部归零」）；
+//   - 未知/已软删除 id → 忽略（列表可能已过期，不因竞态整单失败；
+//     重复 id 亦按首次出现位置收敛，不会重复赋值）；
+//   - 未在列表中的可见项目按当前相对顺序续排在后（防止它们与新序号撞值）；
+//   - 软删除行不动（恢复时沿用自己的序号，回到原位附近）。
+func (r *WorkspaceRepository) Reorder(orderedIDs []uint) error {
+	if len(orderedIDs) == 0 {
+		return nil
+	}
+
+	return r.db.Transaction(func(tx *gorm.DB) error {
+		// 可见项目的当前顺序（与新序号对齐的「其余项目」基准）
+		var visible []model.Workspace
+		if err := tx.Order("sort_order ASC, id ASC").Find(&visible).Error; err != nil {
+			return fmt.Errorf("load workspaces for reorder: %w", err)
+		}
+		valid := make(map[uint]bool, len(visible))
+		for _, ws := range visible {
+			valid[ws.ID] = true
+		}
+
+		// 目标顺序 = 请求列表中仍有效的 id（按请求顺序）+ 未列出的可见项目（按当前顺序）
+		ordered := make([]uint, 0, len(visible))
+		for _, id := range orderedIDs {
+			if valid[id] {
+				ordered = append(ordered, id)
+				delete(valid, id)
+			}
+		}
+		for _, ws := range visible {
+			if valid[ws.ID] {
+				ordered = append(ordered, ws.ID)
+			}
+		}
+
+		for i, id := range ordered {
+			if err := tx.Model(&model.Workspace{}).
+				Where("id = ?", id).
+				Update("sort_order", i).Error; err != nil {
+				return fmt.Errorf("update sort_order for workspace %d: %w", id, err)
+			}
+		}
+		return nil
+	})
 }
 
 // GetDefault 获取默认工作区（is_default = true；config session.default_cwd 对应的路径）。
