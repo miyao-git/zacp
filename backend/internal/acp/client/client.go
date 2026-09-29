@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	acp "github.com/coder/acp-go-sdk"
 )
@@ -70,6 +71,12 @@ type Bridge struct {
 	// 历史回放、不是本轮输出。静音期间该 session 的 push 事件直接丢弃：不入缓存、
 	// 不触发 onEvent 广播。
 	mutedSessions map[string]bool
+	// lastPushAt 各会话最近一次收到事件的时刻（**含被静音丢弃的**）。
+	// 静音窗口要按「事件停止到达」而不是「session/load 响应返回」来关闭，
+	// 见 WaitForReplayQuiescence。
+	lastPushAt map[string]time.Time
+	// mutedDropped 各会话静音期间丢弃的事件数（诊断日志用，读取后清零）
+	mutedDropped map[string]int64
 	// eventSeq 事件序号发号器（Bridge 级、单调递增、进程内永不重置）。
 	// 每次 push 分配一个，随事件一起广播并留在缓存里；WS resync 回放时把快照的
 	// 最大 seq 一并下发，前端据此丢弃「快照里已包含、却在回放之后才广播到」的
@@ -102,6 +109,8 @@ func New(log *slog.Logger, autoApprove bool) *Bridge {
 		autoApprove:     autoApprove,
 		eventsBySession: make(map[string][]Event),
 		mutedSessions:   make(map[string]bool),
+		lastPushAt:      make(map[string]time.Time),
+		mutedDropped:    make(map[string]int64),
 	}
 }
 
@@ -153,6 +162,10 @@ func (b *Bridge) ResetSession(sessionID string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	delete(b.eventsBySession, sessionID)
+	// 顺带清掉本轮的静默判定基线与丢弃计数，避免这两个 map 随会话数无界增长
+	//（下次 session/load 会由 SetMuted 重新打基线，见 WaitForReplayQuiescence）
+	delete(b.lastPushAt, sessionID)
+	delete(b.mutedDropped, sessionID)
 }
 
 // Events returns a copy of buffered events for one ACP session.
@@ -192,16 +205,63 @@ func (b *Bridge) SetMuted(sessionID string, muted bool) {
 	defer b.mu.Unlock()
 	if muted {
 		b.mutedSessions[sessionID] = true
+		// 以「开始静音」的时刻作为静默判定基线：agent 完全不回放历史时，
+		// 基线会自然老化超过 quietFor，WaitForReplayQuiescence 立刻返回，不会白等
+		b.lastPushAt[sessionID] = time.Now()
 	} else {
 		delete(b.mutedSessions, sessionID)
 	}
 }
 
+// WaitForReplayQuiescence 阻塞到该会话的事件流静默下来（或超时）。
+//
+// 为什么需要：ACP 的预期是 agent 在 session/load **响应之前**把历史上下文回放成
+// session/update 通知，但实测 qodercli 是在响应返回之后才灌——load 返回时只到了
+// 3 条，随后 60ms 内涌进 630 条整段历史。静音窗口若只覆盖 LoadSession 调用本身，
+// 这批回放就会漏进本轮事件缓存，既被广播到前端（刚发的消息下面刷出上一轮甚至整段
+// 历史、块序错乱），又被落库（错误内容持久化，刷新也不会消失）。
+// 因此静音必须延续到「不再有事件到达」为止再解除。
+//
+// quietFor：连续多久没有新事件即视为回放结束；timeout：兜底上限——异常 agent
+// 持续推送时不能无限阻塞会话恢复，超时后照常解除静音（宁可漏挡一点回放）。
+func (b *Bridge) WaitForReplayQuiescence(sessionID string, quietFor, timeout time.Duration) {
+	deadline := time.Now().Add(timeout)
+	ticker := time.NewTicker(20 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		b.mu.Lock()
+		last := b.lastPushAt[sessionID]
+		b.mu.Unlock()
+		// last 为零值（该会话从未有过事件）时 Since 极大，直接判定静默
+		if time.Since(last) >= quietFor {
+			return
+		}
+		if time.Now().After(deadline) {
+			b.log.Warn("session load replay still streaming, giving up waiting",
+				"sessionID", sessionID, "timeout", timeout.String())
+			return
+		}
+		<-ticker.C
+	}
+}
+
+// TakeMutedDropped 返回并清零该会话静音期间丢弃的事件数（供恢复流程打日志）。
+func (b *Bridge) TakeMutedDropped(sessionID string) int64 {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	n := b.mutedDropped[sessionID]
+	delete(b.mutedDropped, sessionID)
+	return n
+}
+
 func (b *Bridge) push(e Event) {
 	b.mu.Lock()
+	// 静音期间也要记时刻：静默判定要靠「回放是否还在到达」，见 WaitForReplayQuiescence
+	b.lastPushAt[e.SessionID] = time.Now()
 	if b.mutedSessions[e.SessionID] {
 		// 会话恢复（session/load）回放期间：事件是历史回放、不是本轮输出，
 		// 直接丢弃（不入缓存、不广播），历史内容已由 DB 持久化，无损失。
+		b.mutedDropped[e.SessionID]++
 		b.mu.Unlock()
 		return
 	}

@@ -1248,6 +1248,15 @@ func (c *AgentConnection) CreateSession(ctx context.Context, cwd string) (acp.Se
 	return sess.SessionId, sess.ConfigOptions, nil
 }
 
+// session/load 历史回放的静音窗口参数（背景见 LoadSession 内注释）：
+//   - replayQuietWindow：连续这么久没有新事件即认为回放已灌完；实测 qodercli 的
+//     630 条回放在 60ms 内到达，500ms 足够覆盖慢速回放的 agent；
+//   - replayWaitTimeout：兜底上限，异常 agent 持续推送时不能无限阻塞会话恢复。
+const (
+	replayQuietWindow = 500 * time.Millisecond
+	replayWaitTimeout = 20 * time.Second
+)
+
 // LoadSession 恢复已有 session。
 // cwd 必须与创建该 session 时的工作区一致：agent（如 omp）的 session/load 按
 // cwd 定位磁盘会话文件（cwd 映射到 workspace 目录，session 文件存在其下），
@@ -1266,6 +1275,12 @@ func (c *AgentConnection) LoadSession(ctx context.Context, sessionID acp.Session
 	// 这些是历史回放、不是本轮输出：先对该 session 静音（见 client.Bridge.SetMuted），
 	// 期间事件丢弃不入缓存、不广播，避免前端把历史消息追加到当前 turn 的占位消息上
 	//（表现为「用户发送后立即显示上一轮 AI 消息」）；历史内容已由 DB 持久化，无损失。
+	//
+	// 静音窗口不是「LoadSession 调用区间」而是「到回放真正静默为止」：ACP 预期回放
+	// 在 load 响应之前完成，但实测 qodercli 是响应返回后才灌（返回时只到了 3 条，
+	// 随后 60ms 内涌进 630 条整段历史）。窗口过早关闭会让历史漏进本轮事件流：
+	// 既广播到前端（刚发的消息下面刷出整段历史、块序错乱），又随本轮 assistant
+	// 消息落库（错误内容持久化，刷新也不消失）。见 Bridge.WaitForReplayQuiescence。
 	c.bridge.SetMuted(string(sessionID), true)
 	defer c.bridge.SetMuted(string(sessionID), false)
 
@@ -1282,6 +1297,13 @@ func (c *AgentConnection) LoadSession(ctx context.Context, sessionID acp.Session
 	})
 	if err != nil {
 		return fmt.Errorf("load session: %w", err)
+	}
+
+	// 等历史回放灌完再解除静音（窗口说明见上面 SetMuted 处注释）
+	c.bridge.WaitForReplayQuiescence(string(sessionID), replayQuietWindow, replayWaitTimeout)
+	if dropped := c.bridge.TakeMutedDropped(string(sessionID)); dropped > 0 {
+		c.log.Info("session load replay suppressed",
+			"agent", c.provider.ID, "sessionId", sessionID, "dropped", dropped)
 	}
 
 	c.sessions[sessionID] = &SessionState{
