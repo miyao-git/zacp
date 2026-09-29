@@ -85,7 +85,7 @@ const SESSION_RESOLVE_TIMEOUT_MS = 15_000
 export const MAX_SESSIONS_PER_WORKSPACE = 60
 export const SESSIONS_PAGE_SIZE = 20
 /** 同时打开的项目数上限（前端创建限制） */
-export const MAX_WORKSPACES = 10
+export const MAX_WORKSPACES = 50
 /** 实时工具调用卡片（流式 turn 中显示，turn.done 后随历史 events 持久化渲染） */
 export interface ToolCard {
   toolId: string
