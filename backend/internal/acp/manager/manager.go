@@ -730,7 +730,9 @@ var uuidLikeRe = regexp.MustCompile(`[0-9a-f]{8,}`)
 // 不同 agent 对「会话失效」返回的错误文本不同，这里统一做大小写不敏感匹配：
 //   - omp（pi 系）：`{"code":-32603,...,"details":"Unsupported ACP session: <uuid>"}`
 //   - reasonix 等：`session/<uuid>: unknown session <uuid>`
-//   - qoder 等：`{"code":-32603,...,"details":"Session not found: <uuid>"}`
+//   - qoder 等：`{"code":-32603,...,"details":"Session not found: <uuid>"}`；
+//     已被清理的会话（agent 重启后内存无记录、磁盘也无文件）返回整短语
+//     `Invalid session identifier "<id>". ... Use --list-sessions ...`
 //
 // 判定前置条件：错误文本必须同时含 "session" 与 session id（uuid / hex 前缀）。
 // 已知 agent 的失效错误都带 id，要求 id 共现可排除无 id 的误伤文本，例如：
@@ -765,6 +767,12 @@ func IsUnknownSessionErr(err error) bool {
 		if strings.Contains(msg, word) {
 			return true
 		}
+	}
+	// 整短语补充：qodercli 对「已被清理的会话」的措辞是
+	// `Invalid session identifier "<id>" ...`；"invalid" 一词因语义过宽
+	// 不能进上面的通用词表（见注释），按整短语匹配兼顾准确与覆盖。
+	if strings.Contains(msg, "invalid session identifier") {
+		return true
 	}
 	return false
 }

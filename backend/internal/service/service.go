@@ -382,6 +382,8 @@ func (s *SessionService) deleteOrCloseAgentSession(ctx context.Context, agentID,
 }
 
 // cleanupAgentSession 异步清理 agent 侧会话数据（总预算 agentSessionCleanupTimeout）：
+//  0. 按需拉起 agent：协议层清理需要在线进程，agent 被空闲回收/服务重启后
+//     此前会静默失败（会话持久化数据残留在 agent 磁盘上）；
 //  1. 协议层清理（delete → close 降级，见 deleteOrCloseAgentSession）；
 //  2. 仍失败 → 兜底：仅当该 agent 在 DB 中已无任何会话时才停止其进程（此时 kill
 //     无副作用）；还有其它会话则保留进程、记 WARN——宁可残留单个会话数据，
@@ -391,6 +393,11 @@ func (s *SessionService) cleanupAgentSession(session *model.Session) {
 	defer cancel()
 
 	agentID, acpID := session.AgentID, session.ACPSessionID
+	if err := s.mgr.EnsureStarted(ctx, agentID); err != nil {
+		// 启动失败仅告警：此时通常也确无进程可回收，继续走兜底判定
+		slog.Warn("cleanup agent session: ensure agent started failed",
+			"agent", agentID, "session", acpID, "err", err)
+	}
 	if s.deleteOrCloseAgentSession(ctx, agentID, acpID) {
 		return
 	}
