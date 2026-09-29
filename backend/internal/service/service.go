@@ -158,6 +158,9 @@ type SessionService struct {
 	mgr           *manager.Manager
 	// defaultCwd 是 config session.default_cwd；创建会话未指定工作区时的回退路径。
 	defaultCwd string
+	// contextWindowOf 返回 agent 的上下文窗口（token 数），由组装层注入
+	// config.ContextWindowOf；供 GetContextUsage 估算占用百分比时取分母。
+	contextWindowOf func(agentID string) int
 
 	// OnSessionRebuilt 可选回调：ACP 会话重建（id 变化）后触发，由组装层注入
 	//（如 ws.Handler.RebindSession），使 REST 路径重建后也能迁移 WS 订阅，
@@ -166,13 +169,14 @@ type SessionService struct {
 }
 
 // NewSessionService 创建会话服务
-func NewSessionService(workspaceRepo *store.WorkspaceRepository, sessionRepo *store.SessionRepository, msgRepo *store.MessageRepository, mgr *manager.Manager, defaultCwd string) *SessionService {
+func NewSessionService(workspaceRepo *store.WorkspaceRepository, sessionRepo *store.SessionRepository, msgRepo *store.MessageRepository, mgr *manager.Manager, defaultCwd string, contextWindowOf func(agentID string) int) *SessionService {
 	return &SessionService{
-		workspaceRepo: workspaceRepo,
-		sessionRepo:   sessionRepo,
-		msgRepo:       msgRepo,
-		mgr:           mgr,
-		defaultCwd:    defaultCwd,
+		workspaceRepo:   workspaceRepo,
+		sessionRepo:     sessionRepo,
+		msgRepo:         msgRepo,
+		mgr:             mgr,
+		defaultCwd:      defaultCwd,
+		contextWindowOf: contextWindowOf,
 	}
 }
 

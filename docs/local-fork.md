@@ -88,6 +88,39 @@ cd ~/prj/zacp && ./scripts/build.sh
    - 修复：增量缺本轮 DB user 时保留乐观 user 气泡（`dbUserMessage` 判定）；已验证正常路径无重复、用 CDP 拦截增量响应剥掉 user 后气泡仍保留
    - 排查线索（下次复现时看）：线上日志里该轮 prompt 报过 `acp session invalid, recovering`（服务重启后首条 prompt 触发 session/load），恢复重放的事件会被写进该轮 assistant 消息（时间线里能看到更早的 `user_message`/`tool_call`，消息体积异常大）——若有异常，先看这一轮的日志与消息 events
 
+9. **对话展示细节三项 + 输入框上下文占用百分比**：
+   - 思考过程面板移到消息**底部**（`frontend/src/components/chat/MessageItem.vue`）：`<details open>` 默认展开，内容区 `max-h-[5lh]`（5 行窗口：短内容自适应、长内容滚动）并自动贴底显示最新思考（内容增长 / 异步加载完成 / 重新展开都贴底）；`/thoughts` 按需加载不再依赖用户点击——挂载即补拉一次，流式占位转正后内容被列表瘦身置空时再补拉一次（`ensureReasoningLoaded` 幂等：已有内容/加载中/已加载直接返回）
+   - 正式回复去边框：`IncremarkContent` 与流式加载占位去掉 `border / bg / px-4 / shadow`（纯文本铺满，左右边缘与工具调用卡对齐）；同步删掉 `.incremark-table-wrapper` 的 `-16px` 负边距补偿（原为抵消 px-4，前提已不存在）
+   - 上下文占用百分比（输入框配置行内、思考强度等配置项之后；深绿实心 + 斜纹余量 + 百分比）：
+     - 后端：`agents[].context_window` 新配置项（未配置回退 `config.DefaultContextWindowTokens` = 200000）+ `GET /api/v1/sessions/:id/context-usage`（`internal/service/context_usage.go`：按会话全部消息的正文/思考/工具入参出参折算 token；工具入参出参以 `tool_details` 快照为准去重；CJK 按 1 token/字、其余按 3.5 字符/token）
+     - **实测结论：qodercli 不推送 ACP `usage_update`，prompt 响应的 `usage` 与 `_meta.quota` 恒为 0**（一次性探针直连验证）→ 百分比只能是估算值；估算不含 agent 侧系统提示词/工具定义，也不感知 agent 自身压缩，tooltip 已标注「估算」
+     - 前端：`ContextUsageBadge.vue`（亮/暗双色、空会话不渲染）+ store 在 `resolveSession`（进会话）与 `refreshAfterTurn`（每轮结束）刷新（后台会话跳过、切会话清空）
+     - `~/.zacp/config.toml` 的 qoder agent 已加 `context_window = 1000000`（dfmodel 的 `max_input_tokens`，取自 qodercli 运行日志）
+   - 已验证（隔离实例 + headless Chrome/CDP）：真实回合流式（占位圆点无边框、工具卡与正文同宽、思考面板在底部）、折叠后经重排仍保持折叠、每轮结束占比刷新（23% → 100%，用 30 token 窗口放大观察）、亮/暗配色、低占比斜纹/高占比实心、空会话不显示、接口 404/400 分支
+   - 已知问题（既有，非本次引入）：用「最近列表之外」的旧会话 URL 直开时页面停在「加载会话中…」（`loadSessions` 内部 `resolveSession(cur)` 与 ChatPane 的 resolve 抢 ticket 导致结果被丢弃）；本次未修，遇到时刷新/从侧栏点入即可
+
+10. **右侧消息导航条（替代「回到顶部 / 底部」双按钮）**：
+   - 删除 `MessageList` 右侧上下两个圆形按钮；`useChatScroll` 随之瘦身（去掉 `atTop` / `showBackToBottom` / `scrollUp` / `scrollDown` / `scrollToTop`），只保留贴底跟随与滚动动作
+   - 新增 `frontend/src/components/chat/MessageNavRail.vue`（仅 lg+）：每轮用户消息一条横杠，当前阅读位置深色（`bg-ink`）、其余浅灰（亮色 slate-300 / 暗色 slate-600）；hover 向左展开预览卡片（单行截断、点击跳转、当前项自动滚入可视区）；用户消息 ≤ 1 条不渲染
+   - 「当前项」判定在 `MessageList` 内按 `data-msg-id` 元素位置计算（视口顶部 48px 判定带，取最后一条越过的用户消息；`MessageItem` 根节点新增该属性），滚动时 rAF 节流重算；跳转按元素偏移平滑滚动（顶部留 12px 余量）
+   - 「回到底部」按钮移到对话框正上方居中（沿用原按钮样式 h-7 w-7），滚动时浮现、停止滚动 0.6s 后淡出（`opacity` 过渡 + `pointer-events-none`），贴底时始终隐藏
+   - 已验证（隔离实例 + headless Chrome/CDP）：6 条用户消息时横杠与当前项定位（贴底 = 末条、滚到 35% = 第 4 条、点击第 1 条后 active=0）、真实鼠标 hover 展开（容器宽 256px、预览列 208px）、点击横杠跳转滚动到位、按钮「贴底隐藏 / 滚动浮现 / 停止 0.9s 后隐藏 / 点击回底」、亮暗两色、单条用户消息不显示
+
+11. **响应过程中发送消息（steer 队列）**：
+   - 交互：会话正在响应时，输入框仍可发送（回车或点击发送按钮，发送按钮与停止按钮并存）；消息进入 steer 队列，在**输入框上方**以「扑克牌叠放」展示——输入框是最前一张（完整可见、位于最下），每条 steer 逐层向上错位、被更靠前的一张压住下半部分（只露上边一行文本，顶对齐所以文字完整可读），最早发出的排在最上层（最后一层），每张右侧的编辑按钮可把消息取回输入框修改（见 `Composer.vue` `steerStackItems` / `onEditSteer`）
+   - 队列存前端（`stores/session.ts`）：本轮结束（`refreshAfterTurn` 收尾 / `endStreamTurn` 异常收尾）后由 `flushSteerQueue` 自动接力发送队首（一次一条，发完继续接力）；发送失败放回队首避免内容丢失；用户点停止（`cancelSend`）清空队列，不留下没有回复的孤儿消息
+   - 后端保留同会话排队作为兜底（`ws/bridge.go` `acquireTurnOrEnqueue` / `finishTurnAndNext` / `chainNextQueued`）：自动接力恰好撞上服务端收尾窗口、或其它入口（REST）正在跑本会话时，消息落库后排队而不是报 `ErrPromptInProgress`；`turn.started` 与上一轮 `turn.done` 的广播顺序由接力链保证（先收尾再开新轮）；`HandleCancel` 先丢弃排队消息再取消执行中的轮次；resync 的 `HasPromptInProgress` 把排队也算作 running
+   - **ACP 实测结论（重要）**：ACP 协议与 SDK 都没有 steer 概念（`grep steer` 无命中），qodercli 二进制里虽实现的是「本地交互式注入」（`injectionService.addInjection(text,"user_steering")`），但经 ACP 并发发 prompt 时只会**排队成下一轮**（探针实测：第二条 prompt 在当前轮结束后作为新一轮执行，prompt 响应的 stopReason 等均按普通轮次返回）——因此这里的 steer 是「本轮结束后立即执行的排队消息」，不是「打断当前轮改道」
+   - 视觉：steer 叠层与输入框**连成一摞**（栈容器 -mb-1.5、输入框 z-40 压住后层下沿，无缝隙）；每张 steer 卡片保留自身 12px 圆角（露出的就是卡片上沿），仅输入卡片在有叠层时去掉上圆角，让交界处成一条直线——既保留扑克牌圆角，又不出现「折回去」的缺口；每条露出的正好是一行文本 + 右侧编辑按钮
+   - 顺带：消息列左右内边距改为与输入框一致（`MessageList.vue` `px-3 lg:px-0`），对话记录与输入框卡片等宽（DOM 实测 422..1318 完全一致）
+   - 已验证（隔离实例 + 真实回合 + CDP）：流式中发送 1/2/3/6 条 → 卡片叠放（DOM 实测：最新的紧贴输入框、z 最高，最早的 top=0 在最上层；每层可见 24px 文本行 + 编辑按钮）；点最上层（最早发出）编辑 → 文本回到输入框、卡片减少；首轮结束后按 FIFO 自动接力（数据库消息序列 = user1/assistant1/user2/assistant2/…，卡片数 3→2→1→0）；亮/暗两色、几何实测栈底(770) 与输入框顶(764) 重叠 6px
+
+12. **输入条浮层化 + 与消息列严格对齐（WebUI 视觉收尾）**：
+   - 输入条（含 steer 叠层、错误/断线提示条）从流内布局改为**悬浮层**（`ChatPane.vue`：消息区 `relative flex-1` + 浮层 `absolute inset-x-0 bottom-0 z-30`，空白处 `pointer-events-none`），消息可滚到浮层下方，消除「消息区 / 输入框」之间的空白分区带；浮层高度由 `ResizeObserver` 实测写入 `--composer-h`
+   - `--composer-h` 消费方：消息列底部留白 `pb-[calc(var(--composer-h,6rem)+1.5rem)]`（最后一条能滚到浮层上方）、「回到底部」按钮 `bottom-[calc(var(--composer-h)+0.75rem)]`、右侧消息导航条改为在「浮层以上」的高度带内垂直居中（`bottom-[calc(var(--composer-h)+0.5rem)]` + `max-h-full`）
+   - 宽度对齐：消息区滚动条占布局宽度（实测 `clientWidth 1130` vs `offsetWidth 1140`），输入条不滚动 → 两者 `mx-auto` 居中时消息列整体偏半个滚动条宽。`MessageList` 把滚动条宽度写入 `--msg-scrollbar-w`，输入条外层 `.composer-shell` 按同宽度留白（必须加在 `max-w` 容器之外，否则会压窄卡片）；实测消息列与输入卡片 rect 完全一致（417..1313）
+   - 已验证（隔离实例 + CDP 几何量测）：`alignLeft/alignRight = 0`、浮层高度 144px 与变量一致、最后一条消息与卡片间距 32px（=留白 24 + 卡片顶距 8）、导航条带 53..748（卡片顶 764 之上）、亮色截图确认无分区空白带
+
 （前批改动验证记录：杀 agent 确认 → 网页删除 → qodercli 会话文件自动删除（进程被按需拉起）；无效会话删除无降级告警；启动耗时隔离环境实测 4446ms → 66ms，真实服务重启健康检查通过。）
 
 ## 4. 与 qodercli 的会话同步（重要背景）

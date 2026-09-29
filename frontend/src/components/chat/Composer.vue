@@ -2,12 +2,13 @@
 import { computed, h, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import type { VNodeChild } from 'vue'
 import { useI18n } from 'vue-i18n'
-import { AddOutline, OptionsOutline, SendOutline, StopOutline } from '@vicons/ionicons5'
+import { AddOutline, CreateOutline, OptionsOutline, SendOutline, StopOutline } from '@vicons/ionicons5'
 import { NIcon, useMessage } from 'naive-ui'
 import type { InputInst, SelectGroupOption, SelectOption } from 'naive-ui'
 import { useSessionStore, MAX_TURNS_PER_SESSION, type SessionStreamStatus } from '@/stores/session'
 import { uploadTempFiles } from '@/api'
 import { extractPastedFiles, prepareFile } from '@/utils/fileUpload'
+import ContextUsageBadge from '@/components/chat/ContextUsageBadge.vue'
 import type { ConfigOptionValue } from '@/types/models'
 
 /** Composer 提交载荷（card / bar 共用） */
@@ -290,11 +291,8 @@ async function pasteUpload(file: File) {
   }
 }
 
-/** 把引用（@文件名）插入到文本最前面，多个用空格分隔；末尾带尾随空格，用户可直接继续输入 */
-function insertRefs(names: string[]) {
-  const refs = names.map((n) => `@${n}`).join(' ') + ' '
-  text.value = text.value ? `${refs}${text.value}` : refs
-  // rAF 保证 DOM 已按新 value 更新后再设置光标（与 pickSlashCommand 同模式）
+/** 聚焦输入框并把光标移到文本末尾（rAF 保证 DOM 已按新 value 更新后再设光标） */
+function focusInputAtEnd() {
   requestAnimationFrame(() => {
     inputRef.value?.focus()
     const el = (
@@ -302,6 +300,69 @@ function insertRefs(names: string[]) {
     ).textareaElRef
     if (el) el.setSelectionRange(text.value.length, text.value.length)
   })
+}
+
+/** 把引用（@文件名）插入到文本最前面，多个用空格分隔；末尾带尾随空格，用户可直接继续输入 */
+function insertRefs(names: string[]) {
+  const refs = names.map((n) => `@${n}`).join(' ') + ' '
+  text.value = text.value ? `${refs}${text.value}` : refs
+  focusInputAtEnd()
+}
+
+// ---------------------------------------------------------------------------
+// steer 排队条（响应过程中发送的消息）
+//
+// 会话正在响应时发送的消息进入 store 的 steer 队列，在**输入框上方**以「扑克牌
+// 叠放」方式展示：输入框是最前一张（完整可见，位于最下），每条 steer 依次向上
+// 错位、被更靠前的一张压住下半部分（z 随之外递减），因此每张都露出上边——正好是
+// 它的一行文本（顶对齐），每条消息都可见可编辑；最早发出的排在最上层（最后一层）。
+// 本轮结束后 store 自动接力发送队首（见 session store flushSteerQueue）。
+// ---------------------------------------------------------------------------
+
+/** 每层露出的高度：等于卡片内文本行的高度（顶对齐），保证每条消息都能看到 */
+const STEER_CARD_PEEK_PX = 24
+/** 卡片高度（h-9 = 36px；被压住的下半部分是空白，作为「牌」的厚度） */
+const STEER_CARD_HEIGHT_PX = 36
+
+/** 当前会话排队中的 steer 消息（草稿态无队列） */
+const steerItems = computed(() => sessionStore.steerQueueOf(sessionStore.currentId))
+
+/** 叠放顺序：最新的紧贴输入框上方（i=0），最早的排到最上层（最后一层） */
+const steerStackItems = computed(() => [...steerItems.value].reverse())
+
+/** 叠放容器高度：最上层那张露出的一条 + 最前一张的完整高度 */
+const steerStackHeight = computed(() => {
+  const n = steerStackItems.value.length
+  return n === 0 ? 0 : STEER_CARD_HEIGHT_PX + (n - 1) * STEER_CARD_PEEK_PX
+})
+
+/**
+ * 第 i 层（0 = 紧贴输入框、最前）的位置：越靠后的层越往上，z 随之递减，
+ * 于是后层被前层压住下半部分、只露上边一条。
+ */
+function steerLayerStyle(index: number) {
+  const n = steerStackItems.value.length
+  return {
+    top: `${(n - 1 - index) * STEER_CARD_PEEK_PX}px`,
+    zIndex: 30 - index,
+  }
+}
+
+/**
+ * 编辑排队中的 steer 消息：从队列取回文本填入输入框并聚焦（已有草稿时追加到
+ * 末尾，避免覆盖用户正在写的内容），随后可修改再发送。
+ */
+function onEditSteer(id: number) {
+  const sessionId = sessionStore.currentId
+  if (sessionId === null) {
+    return
+  }
+  const queued = sessionStore.takeSteerMessage(sessionId, id)
+  if (queued === null) {
+    return
+  }
+  text.value = text.value.trim() ? `${text.value}\n${queued}` : queued
+  focusInputAtEnd()
 }
 
 // ---------------------------------------------------------------------------
@@ -375,15 +436,7 @@ function pickSlashCommand(index?: number) {
   if (!cmd) return
   text.value = `/${cmd.name} `
   slashDismissed.value = true
-  // 光标移到末尾（inputRef 为 naive-ui InputInst：暴露 textareaElRef，
-  // 类型未导出故断言；rAF 保证 DOM 已按新 value 更新后再设置光标）
-  requestAnimationFrame(() => {
-    inputRef.value?.focus()
-    const el = (
-      inputRef.value as unknown as { textareaElRef?: HTMLTextAreaElement }
-    ).textareaElRef
-    if (el) el.setSelectionRange(text.value.length, text.value.length)
-  })
+  focusInputAtEnd()
 }
 
 /** 新建会话空态（card）自动聚焦输入框：进入 /new 即可直接打字。
@@ -473,9 +526,47 @@ function onKeydown(e: KeyboardEvent) {
 </script>
 
 <template>
-  <div
-    class="relative w-full rounded-2xl border border-divider bg-surface-raised p-3 shadow-sm transition-shadow focus-within:border-divider focus-within:shadow-md"
-  >
+  <!-- 外层只做「输入框 + 上方叠放排队卡片」的容器；输入卡片本身保持原有结构 -->
+  <div class="relative w-full">
+    <!-- steer 排队条（扑克牌叠放）：位于输入框上方，输入框是最前一张（完整可见、在最下）；
+         每条 steer 逐层向上错位，被更靠前的一张压住下半部分（只露上边一行文本，
+         顶对齐所以文字完整可读），最早发出的排在最上层（最后一层）；每张右侧都有
+         编辑按钮（取回输入框修改）。本轮结束后 store 自动接力发送队首。 -->
+    <div
+      v-if="steerStackItems.length"
+      class="relative -mb-1.5 w-full"
+      :style="{ height: `${steerStackHeight}px` }"
+    >
+      <!-- 每张 steer 卡片保留自身的圆角（叠放时只露上边，看得到的就是卡片上沿）；
+           与输入框相接的那一段由输入框去上圆角抹平，避免交界处出现「折回去」的缺口 -->
+      <div
+        v-for="(item, i) in steerStackItems"
+        :key="item.id"
+        data-steer-card
+        class="absolute inset-x-0 flex h-9 items-start gap-2 rounded-xl border border-divider bg-surface-raised px-3 pt-1 shadow-md"
+        :style="steerLayerStyle(i)"
+      >
+        <span class="min-w-0 flex-1 truncate text-sm leading-5 text-ink-secondary" :title="item.text">
+          {{ item.text }}
+        </span>
+        <button
+          type="button"
+          class="shrink-0 cursor-pointer rounded p-0.5 text-ink-muted transition-colors hover:bg-surface-hover hover:text-ink"
+          :title="t('chat.steerEdit')"
+          :aria-label="t('chat.steerEdit')"
+          @click="onEditSteer(item.id)"
+        >
+          <n-icon :size="14"><CreateOutline /></n-icon>
+        </button>
+      </div>
+    </div>
+
+    <!-- 输入卡片：有 steer 叠层时压住其下沿、并去掉上圆角（交界处成一条直线，
+         不出现「折回去」的缺口）；无叠层时保持完整圆角 -->
+    <div
+      class="relative z-40 w-full border border-divider bg-surface-raised p-3 shadow-sm transition-shadow focus-within:border-divider focus-within:shadow-md"
+      :class="steerStackItems.length ? 'rounded-b-2xl' : 'rounded-2xl'"
+    >
     <!-- / 命令候选面板：浮于输入框上方，宽度与输入框一致（容器 relative + 左右对齐） -->
     <div
       v-if="slashVisible"
@@ -575,6 +666,12 @@ function onKeydown(e: KeyboardEvent) {
           />
         </template>
         <span v-else class="text-xs text-ink-muted">{{ t('chat.enterHint') }}</span>
+        <!-- 上下文占用（估算）：放在配置项（模型/思考强度…）之后，样式对齐参考图 -->
+        <ContextUsageBadge
+          v-if="sessionStore.contextUsage"
+          class="shrink-0"
+          :usage="sessionStore.contextUsage"
+        />
       </div>
 
       <!-- 移动端工具组（[+] 图片上传 + 调校配置）：同一容器内部 gap 紧挨，整组固定居左。
@@ -641,12 +738,13 @@ function onKeydown(e: KeyboardEvent) {
           </n-button>
         </span>
         <n-button
-          v-else
+          v-if="status === 'idle' || canSend"
           type="primary"
           size="small"
           circle
           :loading="fileUploading"
           :disabled="!canSend"
+          :title="status === 'idle' ? undefined : t('chat.steerSendHint')"
           @click="onSend"
         >
           <template #icon>
@@ -654,6 +752,7 @@ function onKeydown(e: KeyboardEvent) {
           </template>
         </n-button>
       </div>
+    </div>
     </div>
   </div>
 
@@ -715,6 +814,16 @@ function onKeydown(e: KeyboardEvent) {
         <p v-else class="py-4 text-center text-xs text-ink-muted">
           {{ t('chat.enterHint') }}
         </p>
+        <!-- 上下文占用（估算）：手机上配置行整体隐藏，这里补一份只读展示 -->
+        <div
+          v-if="sessionStore.contextUsage"
+          class="mt-2.5 flex items-center justify-between gap-3 rounded-xl border border-divider bg-surface px-3.5 py-3"
+        >
+          <span class="min-w-0 flex-1 truncate text-sm font-medium text-ink">
+            {{ t('chat.contextUsage') }}
+          </span>
+          <ContextUsageBadge :usage="sessionStore.contextUsage" />
+        </div>
       </div>
       </n-config-provider>
     </n-drawer-content>

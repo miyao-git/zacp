@@ -9,6 +9,7 @@ import {
   removeWorkspace as apiRemoveWorkspace,
   reorderWorkspaces as apiReorderWorkspaces,
   fetchConfigOptions,
+  fetchContextUsage,
   fetchMessageUpdates,
   fetchMessages,
   fetchRecentSessions,
@@ -26,6 +27,7 @@ import type {
   ChatMessage,
   ChatSession,
   ConfigOption,
+  ContextUsage,
   Workspace,
 } from '@/types/models'
 import type {
@@ -277,6 +279,17 @@ export const useSessionStore = defineStore('session', () => {
    */
   const slashCommands = ref<AvailableCommand[]>([])
 
+  /**
+   * 当前会话的上下文用量（估算值，来自 GET context-usage）：
+   * 进入会话与每轮结束后刷新；agent 不提供真实用量，百分比为后端折算值，
+   * 无数据（未加载/请求失败）时为 null → 输入框旁不展示占用条。
+   */
+  const contextUsage = ref<ContextUsage | null>(null)
+  // 切换会话时清空：避免新会话数据返回前，输入框旁短暂展示上一个会话的占比
+  watch(currentId, () => {
+    contextUsage.value = null
+  })
+
   /** 当前会话对象；null 对应空态 */
   const activeSession = computed<ChatSession | null>(() => {
     if (currentId.value === null) {
@@ -331,6 +344,7 @@ export const useSessionStore = defineStore('session', () => {
 		delete streamMsgIdBySession.value[sessionId]
 		delete streamUserIdBySession.value[sessionId]
 		finalizedDbIdBySession.delete(sessionId)
+		delete steerQueueBySession.value[sessionId]
 	}
   /** 首轮 prompt 后若仍是默认标题，安排一次会话详情同步；手动改名会话不参与。 */
   function markInitialSessionDetailRefresh(session: ChatSession) {
@@ -689,6 +703,7 @@ export const useSessionStore = defineStore('session', () => {
         loadMessages(sessionId),
         loadConfigOptions(sessionId),
         loadSlashCommands(sessionId),
+        loadContextUsage(sessionId),
       ])
     } catch (e) {
       if (ticket !== sessionResolveTicket) {
@@ -1299,6 +1314,28 @@ export const useSessionStore = defineStore('session', () => {
     }
   }
 
+  /**
+   * 加载当前会话的上下文用量估算（进入会话时与每轮结束后调用）。
+   * 只对「当前会话」生效：后台会话（多会话并发，A 结束时用户已切到 B）
+   * 不发请求也不写状态——切回 A 时 resolveSession 会重新拉取，
+   * 避免 A 的用量串进 B 的输入框视图。
+   * 失败置 null 隐藏占用条，不影响输入框其余功能。
+   */
+  async function loadContextUsage(sessionId: number) {
+    if (currentId.value !== sessionId) {
+      return
+    }
+    try {
+      const usage = await fetchContextUsage(sessionId)
+      if (currentId.value !== sessionId) {
+        return // 请求期间已切换会话：丢弃过期结果
+      }
+      contextUsage.value = usage
+    } catch {
+      contextUsage.value = null
+    }
+  }
+
   /** 设置会话配置项（select 型：切换模型/思考强度/mode），成功后更新本地 currentValue */
   async function setConfigOption(optionId: string, valueId: string) {
     const sessionId = currentId.value
@@ -1330,6 +1367,9 @@ export const useSessionStore = defineStore('session', () => {
     delete pendingPermissionsBySession.value[sessionId]
     runningSessionIds.value.delete(sessionId)
     lastEventAtBySession.delete(sessionId)
+    // 出错/保险丝收尾同样接力 steer 队列（用户排队的消息不因一次异常被吞掉；
+    // 取消路径已在 cancelSend 清空队列，这里不会误发）
+    flushSteerQueue(sessionId)
   }
 
   /**
@@ -1426,6 +1466,8 @@ export const useSessionStore = defineStore('session', () => {
       await loadMessageUpdates(sessionId, afterId, placeholderId, placeholderUserId)
       // agent 可能在 turn 中经 update 通知更新配置项，刷新以同步最新 currentValue
       await loadConfigOptions(sessionId)
+      // 本轮消息已落库：刷新上下文用量估算（后台会话由 loadContextUsage 内部跳过）
+      await loadContextUsage(sessionId)
       // / 命令首次进入会话时加载，后续依靠 WebSocket 广播更新，不在每轮重复 GET。
       if (initialSessionDetailRefresh.get(sessionId) === 'pending') {
         // 首条 prompt 后服务端可能生成摘要标题；成功同步后标记完成，后续轮次不再请求。
@@ -1458,6 +1500,8 @@ export const useSessionStore = defineStore('session', () => {
       if (placeholderId !== undefined) {
         pendingFinalizePlaceholders.delete(placeholderId)
       }
+      // 本轮已收尾：接力发送 steer 队列里的下一条（响应过程中发送的消息）
+      flushSteerQueue(sessionId)
     }
   }
 
@@ -1651,6 +1695,89 @@ export const useSessionStore = defineStore('session', () => {
     })
   }
 
+  // ---------------------------------------------------------------------------
+  // steer 队列（响应过程中发送的消息）
+  //
+  // 会话已有 turn 在执行时，用户再发的消息进入本队列：显示在输入框上方的
+  // 排队条里（单行截断 + 编辑按钮），等本轮结束后由 flushSteerQueue 自动发出
+  // （走 sendViaWs 正常路径：落库 → 进对话序列 → 流式回复）。
+  // 存前端而不直接交给后端排队的原因：消息在本轮结束前不落库，用户可点「编辑」
+  // 取回输入框修改；用户中途取消时也不会留下一堆没有回复的孤儿用户消息。
+  //（后端 ws/bridge.go 的同会话排队保留为兜底：自动接力发送若恰好撞上后端
+  //  收尾窗口，消息会被排队执行而不是报 ErrPromptInProgress。）
+  // ---------------------------------------------------------------------------
+
+  /** 各会话的 steer 队列（id 为前端自增序号，仅用于列表渲染与编辑定位） */
+  const steerQueueBySession = ref<Record<number, { id: number; text: string }[]>>({})
+  let steerSeq = 0
+
+  /** 入队一条 steer 消息（响应过程中发送） */
+  function enqueueSteer(sessionId: number, text: string) {
+    const queue =
+      steerQueueBySession.value[sessionId] ??
+      (steerQueueBySession.value[sessionId] = [])
+    queue.push({ id: ++steerSeq, text })
+  }
+
+  /** 取会话的 steer 队列（Composer 排队条渲染用；无则空数组） */
+  function steerQueueOf(sessionId: number | null | undefined) {
+    if (sessionId === null || sessionId === undefined) {
+      return []
+    }
+    return steerQueueBySession.value[sessionId] ?? []
+  }
+
+  /**
+   * 取回一条 steer 消息（点排队条上的「编辑」）：从队列移除并返回文本，
+   * 由输入框接管编辑；不存在（已被发送/清空）时返回 null。
+   */
+  function takeSteerMessage(sessionId: number, id: number): string | null {
+    const queue = steerQueueBySession.value[sessionId]
+    if (!queue) {
+      return null
+    }
+    const idx = queue.findIndex((it) => it.id === id)
+    if (idx < 0) {
+      return null
+    }
+    const [item] = queue.splice(idx, 1)
+    if (queue.length === 0) {
+      delete steerQueueBySession.value[sessionId]
+    }
+    return item.text
+  }
+
+  /** 清空会话的 steer 队列（用户取消本轮：与后端「停止即丢弃排队」语义一致） */
+  function clearSteerQueue(sessionId: number) {
+    delete steerQueueBySession.value[sessionId]
+  }
+
+  /**
+   * 本轮结束后接力发送队列里的下一条 steer 消息（仅在该会话已回到 idle 时动作）。
+   * 一次只发一条：发送后状态变为 queued/streaming，后续条目由下一次收尾继续接力。
+   */
+  function flushSteerQueue(sessionId: number) {
+    if (statusOf(sessionId) !== 'idle') {
+      return
+    }
+    const queue = steerQueueBySession.value[sessionId]
+    if (!queue?.length) {
+      return
+    }
+    const [next] = queue.splice(0, 1)
+    if (queue.length === 0) {
+      delete steerQueueBySession.value[sessionId]
+    }
+    void sendViaWs(sessionId, next.text).catch((e) => {
+      // 发送失败（WS 未连接等）：放回队首，避免用户写的内容丢失；错误条提示原因
+      const back =
+        steerQueueBySession.value[sessionId] ??
+        (steerQueueBySession.value[sessionId] = [])
+      back.unshift(next)
+      setSessionStreamError(sessionId, e instanceof Error ? e.message : String(e))
+    })
+  }
+
   /**
    * 发送消息（WS prompt）：乐观追加用户消息 + 空 assistant 占位 →
    * socket 发送 prompt（sessionId 为 ACP session id）→ 事件流式追加 → turn.done 收尾。
@@ -1755,6 +1882,8 @@ export const useSessionStore = defineStore('session', () => {
     if (statusOf(sid) === 'cancelling') {
       return
     }
+    // 停止 = 本会话到此为止：清空排队中的 steer 消息（不再自动接力发送）
+    clearSteerQueue(sid)
     // 优先用发送时快照（草稿不在 sessions 列表），其次当前列表
     const session = sentSessions.get(sid) ?? sessions.value.find((s) => s.id === sid)
     if (session?.acpSessionId) {
@@ -1832,6 +1961,7 @@ export const useSessionStore = defineStore('session', () => {
     pendingPermission,
     configOptions,
     slashCommands,
+    contextUsage,
     activeSession,
     activeMessages,
     defaultWorkspace,
@@ -1847,6 +1977,7 @@ export const useSessionStore = defineStore('session', () => {
     loadMessages,
     loadConfigOptions,
     loadSlashCommands,
+    loadContextUsage,
     setConfigOption,
     // 会话解析状态机（/sessions/:id 存在性校验），见 resolveSession
     sessionResolve,
@@ -1858,6 +1989,11 @@ export const useSessionStore = defineStore('session', () => {
     promoteDraftSession,
     sendViaWs,
     cancelSend,
+    // steer 队列（响应过程中发送的消息：输入框上方排队条 + 本轮结束后自动接力）
+    steerQueueOf,
+    enqueueSteer,
+    takeSteerMessage,
+    clearSteerQueue,
     clearStreamError,
     resolvePermission,
   }

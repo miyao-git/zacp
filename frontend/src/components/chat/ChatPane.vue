@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useRoute, useRouter } from 'vue-router'
 import { useMessage, type DropdownOption } from 'naive-ui'
@@ -179,6 +179,42 @@ function onGoNewSession() {
 /** 当前会话对象；null → 非会话态 */
 const current = computed(() => sessionStore.activeSession)
 
+// ---------------------------------------------------------------------------
+// 悬浮输入层高度同步
+//
+// 输入条（含 steer 叠层）是绝对定位浮层，不占消息区高度；它的高度写入
+// --composer-h，由消息列在底部留白（最后一条能滚到浮层上方）、右侧悬浮控件避让。
+// 输入条/steer 叠层高度随时变化（多条排队消息、提示条出现），用 ResizeObserver 跟随。
+// ---------------------------------------------------------------------------
+
+const composerOverlayRef = ref<HTMLElement | null>(null)
+let composerOverlayObserver: ResizeObserver | null = null
+
+/** 测量浮层高度并写入 CSS 变量（值不变不写，避免无谓样式重算） */
+function syncComposerHeight() {
+  const el = composerOverlayRef.value
+  if (!el) {
+    return
+  }
+  const next = `${Math.round(el.offsetHeight)}px`
+  if (document.documentElement.style.getPropertyValue('--composer-h') !== next) {
+    document.documentElement.style.setProperty('--composer-h', next)
+  }
+}
+
+watch(composerOverlayRef, (el) => {
+  composerOverlayObserver?.disconnect()
+  composerOverlayObserver = null
+  if (!el) {
+    return
+  }
+  composerOverlayObserver = new ResizeObserver(() => syncComposerHeight())
+  composerOverlayObserver.observe(el)
+  syncComposerHeight()
+})
+
+onBeforeUnmount(() => composerOverlayObserver?.disconnect())
+
 /** 当前会话对话轮次（role=user 消息数；口径见 store.turnCountOf）。0 轮不渲染指示器。 */
 const turnCount = computed(() => sessionStore.turnCountOf(current.value?.id))
 
@@ -189,17 +225,21 @@ function agentNameOf(agentId: string): string {
 
 /**
  * 已有会话发送：直接走 store.sendViaWs（WS prompt + 流式事件）。
+ * 会话正在响应（streaming/queued）时改为进入 steer 队列：消息显示在输入框
+ * 上方的排队条里，本轮结束后由 store 自动接力发送（可点「编辑」取回修改）。
  * 空态创建由 NewSessionPane 处理（隐式草稿 → 发首条消息即转正）。
  */
 async function onSubmit(payload: ComposerSubmitPayload) {
   const text = payload.text.trim()
-  // 本会话非空闲时不发送（防止 Composer 停用状态下的竞态双击）
-  if (!text || sessionStore.statusOf(current.value?.id) !== 'idle') {
+  if (!text) {
     return
   }
-
   const session = current.value
   if (!session) {
+    return
+  }
+  if (sessionStore.statusOf(session.id) !== 'idle') {
+    sessionStore.enqueueSteer(session.id, text)
     return
   }
   try {
@@ -288,6 +328,10 @@ function onNewProjectFromHero() {
         </div>
       </div>
 
+      <!-- 消息区 + 悬浮输入层：输入条（含 steer 叠层）作为浮层叠在消息之上，
+           消息可以滚到它下面，两者之间不再有「分区」空白带。
+           浮层高度实测写入 --composer-h：消息列据此在底部留白（最后一条能滚到浮层上方），
+           导航条/回到底部按钮也据此避让（见 MessageList / MessageNavRail）。 -->
       <div class="relative min-h-0 flex-1">
         <MessageList class="h-full min-h-0" />
         <!-- PlanDock 计划面板：仅 lg 及以上显示（手机端精简；absolute 相对于上方 relative 容器定位） -->
@@ -297,47 +341,58 @@ function onNewProjectFromHero() {
             class="absolute left-2 top-1/2 z-20 -translate-y-1/2"
           />
         </div>
-      </div>
 
-      <!-- 当前会话发送/流式错误条（按 session 隔离） -->
-      <div
-        v-if="sessionStore.streamErrorOf(current.id)"
-        class="mx-4 mb-2 flex items-center justify-between rounded-lg bg-red-50 px-3 py-2 text-sm text-red-600 ring-1 ring-inset ring-red-100 dark:bg-red-950/40 dark:text-red-400 dark:ring-red-900/50"
-      >
-        <span class="truncate">
-          {{ t('chat.errorTitle') }}: {{ sessionStore.streamErrorOf(current.id) }}
-        </span>
-        <button
-          class="ml-3 shrink-0 text-red-400 hover:text-red-600"
-          aria-label="close"
-          @click="sessionStore.clearSessionStreamError(current.id)"
+        <!-- 浮层空白处 pointer-events-none：不挡下方消息的点击与选择；
+             提示条与输入卡片各自开启 pointer-events-auto -->
+        <div
+          ref="composerOverlayRef"
+          class="pointer-events-none absolute inset-x-0 bottom-0 z-30"
         >
-          ✕
-        </button>
-      </div>
+          <!-- 当前会话发送/流式错误条（按 session 隔离） -->
+          <div
+            v-if="sessionStore.streamErrorOf(current.id)"
+            class="pointer-events-auto mx-4 mb-2 flex items-center justify-between rounded-lg bg-red-50 px-3 py-2 text-sm text-red-600 ring-1 ring-inset ring-red-100 dark:bg-red-950/40 dark:text-red-400 dark:ring-red-900/50"
+          >
+            <span class="truncate">
+              {{ t('chat.errorTitle') }}: {{ sessionStore.streamErrorOf(current.id) }}
+            </span>
+            <button
+              class="ml-3 shrink-0 text-red-400 hover:text-red-600"
+              aria-label="close"
+              @click="sessionStore.clearSessionStreamError(current.id)"
+            >
+              ✕
+            </button>
+          </div>
 
-      <!-- WS 断线提示：会话仍在本机 running 但实时通道已断；后端任务不受影响，
-           重连后由 store 保险丝自动同步收尾（见 session.ts checkStalledTurns） -->
-      <div
-        v-if="wsDisconnected && currentTurnActive"
-        class="mx-4 mb-2 flex items-center justify-between rounded-lg bg-amber-50 px-3 py-2 text-sm text-amber-700 ring-1 ring-inset ring-amber-200 dark:bg-amber-950/40 dark:text-amber-400 dark:ring-amber-900/50"
-      >
-        <span>{{ t('chat.disconnectedBanner') }}</span>
-      </div>
+          <!-- WS 断线提示：会话仍在本机 running 但实时通道已断；后端任务不受影响，
+               重连后由 store 保险丝自动同步收尾（见 session.ts checkStalledTurns） -->
+          <div
+            v-if="wsDisconnected && currentTurnActive"
+            class="pointer-events-auto mx-4 mb-2 flex items-center justify-between rounded-lg bg-amber-50 px-3 py-2 text-sm text-amber-700 ring-1 ring-inset ring-amber-200 dark:bg-amber-950/40 dark:text-amber-400 dark:ring-amber-900/50"
+          >
+            <span>{{ t('chat.disconnectedBanner') }}</span>
+          </div>
 
-      <!-- 底部输入条：与 AI 内容共用 content-container 宽度（max-w-4xl 居中）。
-           PC 上输入框卡片占满容器全宽（无左右内边距，现状不变）；
-           手机端（<lg）左右加 12px 内边距，避免输入框贴屏幕边缘（用户反馈贴边不友好）。
-           safe-bottom：PC 上等同于 pb-4，手机端叠加 env(safe-area-inset-bottom) 防底部横条遮挡。 -->
-      <div class="content-container safe-bottom px-3 pt-2 lg:px-0">
-        <Composer
-          mode="bar"
-          :agent-id="current.agentId"
-          :status="sessionStore.statusOf(current.id)"
-          :turn-limited="turnCount >= MAX_TURNS_PER_SESSION"
-          @submit="onSubmit"
-          @cancel="sessionStore.cancelSend(current.id)"
-        />
+          <!-- 底部输入条：外层只负责「滚动条宽度补偿 + 安全区/顶部间距」，
+               内层 content-container 与消息列同一套宽度与内边距（px-3 lg:px-0），
+               这样输入卡片与消息列左右边缘严格对齐；PC 上卡片占满容器全宽，
+               手机端左右各 12px 避免贴屏幕边缘。
+               composer-shell：右侧补上消息区滚动条宽度（--msg-scrollbar-w 实测写入）；
+               safe-bottom：PC 上等同 pb-4，手机端叠加 env(safe-area-inset-bottom)。 -->
+          <div class="composer-shell safe-bottom pt-2">
+            <div class="content-container pointer-events-auto px-3 lg:px-0">
+              <Composer
+                mode="bar"
+                :agent-id="current.agentId"
+                :status="sessionStore.statusOf(current.id)"
+                :turn-limited="turnCount >= MAX_TURNS_PER_SESSION"
+                @submit="onSubmit"
+                @cancel="sessionStore.cancelSend(current.id)"
+              />
+            </div>
+          </div>
+        </div>
       </div>
     </div>
   </template>

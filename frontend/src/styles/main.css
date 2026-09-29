@@ -185,6 +185,17 @@ body {
 }
 
 /*
+ * 底部输入条外壳：右侧预留「消息区滚动条宽度」，与消息列同宽对齐。
+ * 消息区在滚动容器内，经典滚动条会占 10~17px 布局宽度，输入条不滚动；
+ * 两者都 mx-auto 居中时消息列会整体偏半个滚动条宽（看起来没对齐）。
+ * --msg-scrollbar-w 由 MessageList 用 ResizeObserver 实测写入（无滚动条时 0px）。
+ * 注意：留白必须加在 max-w 容器之外，否则会直接压缩输入卡片宽度。
+ */
+.composer-shell {
+  padding-right: var(--msg-scrollbar-w, 0px);
+}
+
+/*
  * 移动端安全区（刘海屏 / 底部横条机型）：
  * 底部输入条等贴底元素的下边距叠加 env(safe-area-inset-bottom)。
  * PC 无安全区时 env() 为 0，退化为 1rem，与 Tailwind pb-4 等值（行为不变）。

@@ -55,6 +55,28 @@ type AgentConfig struct {
 	Cwd       string   `mapstructure:"cwd"` // 空则用 session.default_cwd
 	// Env 额外环境变量（key=value 格式），不在此处写密钥。
 	Env []string `mapstructure:"env"`
+	// ContextWindow 该 agent 所用模型的上下文窗口（token 数），用于前端
+	// 展示「上下文占用百分比」的分母。ACP 协议不提供窗口大小（qodercli 等
+	// agent 也不上报 usage_update），只能由用户按所用模型填写；
+	// 0 表示未配置，回退 DefaultContextWindowTokens。
+	ContextWindow int `mapstructure:"context_window"`
+}
+
+// DefaultContextWindowTokens 是 agent 未配置 context_window 时的回退窗口大小。
+// 取 200k：主流长上下文模型的常见档位，仅作为百分比分母的近似，不参与任何逻辑判断。
+const DefaultContextWindowTokens = 200000
+
+// ContextWindowOf 返回指定 agent 的上下文窗口（token 数）：未配置时回退默认值。
+// 供 service 估算上下文占用百分比时取分母；agentID 未知（已删除的 agent）同样回退默认值。
+func (c *Config) ContextWindowOf(agentID string) int {
+	if c != nil {
+		for _, a := range c.Agents {
+			if a.ID == agentID && a.ContextWindow > 0 {
+				return a.ContextWindow
+			}
+		}
+	}
+	return DefaultContextWindowTokens
 }
 
 // AuthConfig 单用户账号认证配置。
@@ -179,6 +201,9 @@ func validate(cfg *Config) error {
 		seen[a.ID] = true
 		if a.Enabled && a.Command == "" {
 			return fmt.Errorf("agents[%d] '%s' is enabled but command is empty", i, a.ID)
+		}
+		if a.ContextWindow < 0 {
+			return fmt.Errorf("agents[%d] '%s' context_window must be >= 0", i, a.ID)
 		}
 	}
 

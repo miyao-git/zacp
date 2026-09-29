@@ -28,6 +28,7 @@ import type {
   ChatMessage,
   ChatSession,
   ConfigOption,
+  ContextUsage,
   DirectoryList,
   ExternalTool,
   FileContent,
@@ -633,6 +634,14 @@ export async function fetchConfigOptions(
     `/api/v1/sessions/${sessionId}/config-options`,
   )
   return data.configOptions
+}
+
+/**
+ * GET /api/v1/sessions/:id/context-usage — 会话上下文用量估算。
+ * 估算值：ACP 不提供真实用量，后端按会话消息内容折算（见后端 service.GetContextUsage）。
+ */
+export async function fetchContextUsage(sessionId: number): Promise<ContextUsage> {
+  return http.get<ContextUsage>(`/api/v1/sessions/${sessionId}/context-usage`)
 }
 
 /** GET /api/v1/sessions/:id/slash-commands — 可用 / 命令（agent 未通告时为空数组） */

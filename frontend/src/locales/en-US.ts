@@ -93,6 +93,12 @@ export default {
     reasoning: 'Thought process',
     reasoningThinking: 'Thinking',
     reasoningLoading: 'Loading thoughts…',
+    // Context usage (estimated; excludes system prompt overhead — see service.GetContextUsage)
+    contextUsage: 'Context usage',
+    contextUsageTip: 'Estimate: ~{used} tokens of {window} window (excludes system prompt overhead)',
+    // Steer queue (messages sent while a turn is running: auto-sent after the turn, editable)
+    steerEdit: 'Edit this queued message',
+    steerSendHint: 'Queue: sent right after the current turn',
     placeholder: 'Message the agent…',
     enterHint: 'Enter to send · Shift+Enter for a new line',
     send: 'Send',
@@ -115,9 +121,8 @@ export default {
     assistant: 'Agent',
     errorTitle: 'Something went wrong',
     disconnectedBanner: 'Connection lost — the task is still running in the background; results will sync automatically',
-    backToBottom: 'Back to bottom',
-    scrollUp: 'Scroll to top',
     scrollDown: 'Scroll to bottom',
+    messageNav: 'Message navigation',
     openTool: 'Open local tool',
     openWebTTY: 'Open Web terminal',
     ttyWorkspaceUnavailable: 'The current session has no usable workspace',

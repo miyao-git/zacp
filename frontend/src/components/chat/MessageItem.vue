@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { IncremarkContent } from '@incremark/vue'
 import { fetchMessageThoughts } from '@/api'
@@ -15,7 +15,10 @@ const props = defineProps<{ message: ChatMessage }>()
 const { t } = useI18n()
 const sessionStore = useSessionStore()
 
-/** 思考过程滚动容器（展开后的内容区，限高 + 滚动，避免长思考把页面撑开） */
+/**
+ * 思考过程滚动容器（面板默认展开，固定 5 行高的窗口，自动贴底显示最新思考）。
+ * 内容变化与展开时都会滚到底部（见 scrollReasoningToBottom）。
+ */
 const reasoningBodyRef = ref<HTMLElement | null>(null)
 
 /** 按需加载的思考过程缓存（展开面板时请求 /thoughts，组件实例级；重复展开不重复请求） */
@@ -83,14 +86,20 @@ const reasoning = computed(() => {
 })
 
 /**
- * 展开思考面板时按需加载完整思考过程（历史消息列表已瘦身置空）。
- * 本地已有内容（流式实时 / 已加载过）或非 assistant 消息时直接跳过；
- * 加载失败保持 idle 状态，用户再次展开可重试；加载成功（含空结果）标记 loaded，
- * 之后重复展开不再请求。
+ * 按需加载完整思考过程（历史消息列表已瘦身置空）。
+ * 面板默认展开，因此不再依赖用户点击：挂载即补拉一次；流式占位转正后本地
+ * 内容被 DB 版（已瘦身）替换为空时也会补拉（见下方 watch）。
+ * 本地已有内容或正在/已加载时直接跳过；加载失败保持 idle 状态，
+ * 用户折叠再展开（或下一轮渲染）可重试；加载成功（含空结果）标记 loaded
+ * 后不再请求。
  */
-async function onToggleReasoning(e: Event) {
-  const open = (e.target as HTMLDetailsElement).open
-  if (!open || reasoning.value || reasoningLoadState.value !== 'idle' || !hasThought.value) {
+async function ensureReasoningLoaded() {
+  if (
+    reasoning.value ||
+    reasoningLoadState.value !== 'idle' ||
+    !hasThought.value ||
+    props.message.role !== 'assistant'
+  ) {
     return
   }
   if (props.message.id < 0 && !props.message.streamFinalized) {
@@ -110,6 +119,26 @@ async function onToggleReasoning(e: Event) {
     return
   }
   reasoningLoadState.value = 'loaded'
+}
+
+/** 把思考窗口滚到底部（贴住最新一行）：内容增长、异步加载完成与面板展开时调用 */
+function scrollReasoningToBottom() {
+  void nextTick(() => {
+    const el = reasoningBodyRef.value
+    el?.scrollTo({ top: el.scrollHeight })
+  })
+}
+
+/**
+ * 面板展开钩子：默认展开（首次无需触发）；用户折叠后再展开时作为失败重试入口，
+ * 并把窗口重新贴到底部（折叠期间内容可能已增长）。
+ */
+function onToggleReasoning(e: Event) {
+  if (!(e.target as HTMLDetailsElement).open) {
+    return
+  }
+  void ensureReasoningLoaded()
+  scrollReasoningToBottom()
 }
 
 /**
@@ -139,22 +168,28 @@ const isStreamingPlaceholder = computed(
 )
 
 /**
- * 流式自动滚底：思考中 agent_thought 持续追加 reasoning，
- * 若用户已展开面板，视口停在顶部会只看到旧内容；这里在内容增长后把滚动容器
- * 滚到底部，让用户追着最新思考看。turn.done 后（isStreamingPlaceholder=false）不再滚动。
+ * 思考窗口内容变化统一处理：
+ * - 内容增长（流式追加 / 异步加载完成）→ 滚到底部，保证窗口里始终是最新 5 行；
+ * - 内容被置空（流式占位转正后由 DB 版替换，历史消息列表已瘦身）→ 触发按需加载，
+ *   避免默认展开的面板空着（ensureReasoningLoaded 幂等：已有内容/加载中/已加载
+ *   都会直接返回，不会重复请求）。
  * 注意：不用 smooth 行为，token 高频追加时平滑动画会累积排队，反而卡顿。
- * 注意：必须定义在 reasoning / isStreamingPlaceholder 之后——Vue 的 watch 注册时会
+ * 注意：必须定义在 reasoning / hasThought 之后——Vue 的 watch 注册时会
  * 立即执行一次 getter 收集依赖，若此时引用尚未初始化的 const 会触发 TDZ 报错。
  */
 watch(
   () => reasoning.value.length,
-  async () => {
-    if (!isStreamingPlaceholder.value) return
-    await nextTick()
-    reasoningBodyRef.value?.scrollTo({ top: reasoningBodyRef.value.scrollHeight })
+  () => {
+    void ensureReasoningLoaded()
+    scrollReasoningToBottom()
   },
 )
 
+/** 挂载即贴底（流式占位挂载时已有内容、不会触发上面的 watch）+ 首次按需加载 */
+onMounted(() => {
+  void ensureReasoningLoaded()
+  scrollReasoningToBottom()
+})
 
 /**
  * 消息渲染块：流式期间用 store.streamBlocks（实时维护），
@@ -266,13 +301,66 @@ const visibleBlocks = computed<MessageBlock[]>(() =>
 </script>
 
 <template>
-  <div class="flex flex-col gap-2" :class="isUser ? 'items-end' : 'items-start'">
-    <!-- 思维/推理文本（流式实时 + 历史按需加载；折叠展示，点击展开查看） -->
-    <!-- 与 AI 内容一致：固定占用整个可用内容宽度（w-full），无 max 宽度限制 -->
-    <!-- 展示依据：hasThought（本地内容或 events 存在 agent_thought type）；新后端列表接口
-         已把 text 置空瘦身，历史内容在展开时经 /thoughts 接口按需加载 -->
+  <!-- data-msg-* 供 MessageList 的消息导航条按 id 定位滚动锚点（DOM 顺序即时间顺序） -->
+  <div
+    class="flex flex-col gap-2"
+    :class="isUser ? 'items-end' : 'items-start'"
+    :data-msg-id="message.id"
+    :data-msg-role="message.role"
+  >
+    <!-- user：右对齐气泡（max-w 限宽 + 强制换行，避免纯英文/长 token 无空格时溢出边框） -->
+    <div
+      v-if="isUser"
+      class="max-w-[85%] min-w-0 wrap-anywhere break-words whitespace-pre-wrap [overflow-wrap:anywhere] rounded-2xl rounded-br-md bg-sky-50 px-3.5 py-2.5 text-sm leading-relaxed text-slate-900 ring-1 ring-inset ring-sky-100 dark:bg-sky-500/15 dark:text-sky-50 dark:ring-sky-500/30"
+    >
+      {{ message.content }}
+    </div>
+
+    <!-- 消息块时间线：按事件顺序交错渲染 AI 文本与工具调用，
+         恢复因果关系（每个工具卡紧跟触发它的文字之后）。
+         正式回复不加边框/底色/内边距：纯文本铺满整行，左右边缘与工具调用卡对齐 -->
+    <template v-for="(block, idx) in visibleBlocks" :key="idx">
+      <!-- 文本块：从 message.content 按 contentSplit 位置切片，
+           流式期间仅最后一个 text block 有内容（其余为空占位） -->
+      <div v-if="block.kind === 'text'" class="w-full min-w-0">
+        <!-- 流式占位：content 为空且 turn 未结束时显示加载动画 -->
+        <div
+          v-if="!block.content.trim() && !isFinished"
+          class="flex w-full min-w-0 items-center gap-1.5 px-0.5 py-1.5"
+          aria-label="loading"
+        >
+          <span v-for="i in 3" :key="i" class="loading-dot" />
+        </div>
+        <IncremarkContent
+          v-else-if="block.content.trim()"
+          class="w-full min-w-0 wrap-anywhere break-words [overflow-wrap:anywhere] [word-break:break-word] overflow-hidden text-sm leading-relaxed"
+          :content="block.content"
+          :is-finished="isFinished"
+          :incremark-options="{ htmlTree: true }"
+        />
+      </div>
+      <!-- 工具调用块 -->
+      <ToolCallCard
+        v-else-if="block.kind === 'tool'"
+        class="w-full"
+        :card="block.card"
+      />
+    </template>
+
+    <!-- 流式初始态：streamBlocks 尚无内容时显示加载动画（首个文本块到达后由 IncremarkContent 接管） -->
+    <div
+      v-if="isStreamingPlaceholder && !visibleBlocks.length"
+      class="flex w-full min-w-0 items-center gap-1.5 px-0.5 py-1.5"
+      aria-label="loading"
+    >
+      <span v-for="i in 3" :key="i" class="loading-dot" />
+    </div>
+
+    <!-- 思维/推理文本：固定在回复底部（正式内容之后），默认展开；
+         窗口最高 5 行、自动贴底滚动显示最新思考，点击标题可折叠 -->
     <details
       v-if="!isUser && hasThought"
+      open
       class="w-full rounded-lg bg-amber-50/70 px-3 py-2 text-xs leading-relaxed text-slate-500 ring-1 ring-inset ring-amber-100 dark:bg-amber-500/10 dark:text-amber-200/80 dark:ring-amber-500/20"
       @toggle="onToggleReasoning"
     >
@@ -292,61 +380,11 @@ const visibleBlocks = computed<MessageBlock[]>(() =>
       </summary>
       <div
         ref="reasoningBodyRef"
-        class="reasoning-scroll mt-1.5 max-h-80 overflow-y-auto overscroll-contain wrap-anywhere break-words whitespace-pre-wrap [overflow-wrap:anywhere] pr-2 [word-break:break-word]"
+        class="reasoning-scroll mt-1.5 max-h-[5lh] overflow-y-auto overscroll-contain wrap-anywhere break-words whitespace-pre-wrap [overflow-wrap:anywhere] pr-2 [word-break:break-word]"
       >
         {{ reasoningLoadState === 'loading' ? t('chat.reasoningLoading') : reasoning }}
       </div>
     </details>
-
-    <!-- user：右对齐气泡（max-w 限宽 + 强制换行，避免纯英文/长 token 无空格时溢出边框） -->
-    <div
-      v-if="isUser"
-      class="max-w-[85%] min-w-0 wrap-anywhere break-words whitespace-pre-wrap [overflow-wrap:anywhere] rounded-2xl rounded-br-md bg-sky-50 px-3.5 py-2.5 text-sm leading-relaxed text-slate-900 ring-1 ring-inset ring-sky-100 dark:bg-sky-500/15 dark:text-sky-50 dark:ring-sky-500/30"
-    >
-      {{ message.content }}
-    </div>
-
-    <!-- 消息块时间线：按事件顺序交错渲染 AI 文本与工具调用，
-         恢复因果关系（每个工具卡紧跟触发它的文字之后） -->
-    <template v-for="(block, idx) in visibleBlocks" :key="idx">
-      <!-- 文本块：从 message.content 按 contentSplit 位置切片，
-           流式期间仅最后一个 text block 有内容（其余为空占位） -->
-      <div
-        v-if="block.kind === 'text'"
-        class="w-full min-w-0 overflow-hidden"
-      >
-        <!-- 流式占位：content 为空且 turn 未结束时显示加载动画 -->
-        <div
-          v-if="!block.content.trim() && !isFinished"
-          class="flex w-full min-w-0 items-center gap-1.5 rounded-xl border border-divider bg-surface-raised px-4 py-3.5 shadow-sm"
-          aria-label="loading"
-        >
-          <span v-for="i in 3" :key="i" class="loading-dot" />
-        </div>
-        <IncremarkContent
-          v-else-if="block.content.trim()"
-          class="w-full min-w-0 wrap-anywhere break-words [overflow-wrap:anywhere] [word-break:break-word] overflow-hidden rounded-xl border border-divider bg-surface-raised px-4 py-3 text-sm leading-relaxed shadow-sm"
-          :content="block.content"
-          :is-finished="isFinished"
-          :incremark-options="{ htmlTree: true }"
-        />
-      </div>
-      <!-- 工具调用块 -->
-      <ToolCallCard
-        v-else-if="block.kind === 'tool'"
-        class="w-full"
-        :card="block.card"
-      />
-    </template>
-
-    <!-- 流式初始态：streamBlocks 尚无内容时显示加载动画（首个文本块到达后由 IncremarkContent 接管） -->
-    <div
-      v-if="isStreamingPlaceholder && !visibleBlocks.length"
-      class="flex w-full min-w-0 items-center gap-1.5 rounded-xl border border-divider bg-surface-raised px-4 py-3.5 shadow-sm"
-      aria-label="loading"
-    >
-      <span v-for="i in 3" :key="i" class="loading-dot" />
-    </div>
   </div>
 </template>
 
@@ -431,8 +469,8 @@ html.dark .loading-dot-sm {
 }
 /*
  * 表格横向滚动（方案 A）：手机端多列表格不强制换行，通过横向滚动保证可读性
- * - .incremark-table-wrapper 本身已有 overflow-x:auto，需突破父级 IncremarkContent 的 overflow-hidden + px-4
- *   负 margin 抵消内边距，max-width 校正，避免滚动条被裁剪
+ * - .incremark-table-wrapper 本身已有 overflow-x:auto；正式回复已去掉外框与内边距
+ *   （无 px-4 可补偿），这里不再做负 margin 抵消，宽度即内容区宽度
  * - 表格 width:max-content + min-width:560px（6列×90px）保证在窄视口下触发滚动，而非等分压缩
  * - 单元格默认 nowrap（表头/数字/状态不换行），仅名称/类别列允许换行（避免超长英文撑破）
  * - 保留 table-layout:fixed 避免打字机流式时列宽抖动
@@ -441,11 +479,7 @@ html.dark .loading-dot-sm {
   overflow-x: auto;
   -webkit-overflow-scrolling: touch;
   overscroll-behavior-x: contain;
-  margin-left: -16px;
-  margin-right: -16px;
-  padding-left: 16px;
-  padding-right: 16px;
-  max-width: calc(100% + 32px);
+  max-width: 100%;
   scrollbar-width: thin;
   scrollbar-color: var(--color-scrollbar-thumb) transparent;
 }

@@ -494,3 +494,33 @@ func (h *SessionHandler) GetMessageThoughts(c *gin.Context) {
 
 	c.JSON(http.StatusOK, gin.H{"reasoning": reasoning})
 }
+
+// GetContextUsage 获取会话上下文用量估算（前端输入框旁展示占用百分比）。
+// GET /api/v1/sessions/:id/context-usage
+// 返回值是估算值：ACP 不提供真实用量（agent 未必上报 usage_update），
+// 由 service 按会话消息内容折算，估算口径见 service.GetContextUsage。
+func (h *SessionHandler) GetContextUsage(c *gin.Context) {
+	sessionID, err := strconv.ParseUint(c.Param("id"), 10, 32)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": gin.H{"code": "invalid_id", "message": "invalid session id"},
+		})
+		return
+	}
+
+	usage, err := h.svc.GetContextUsage(uint(sessionID))
+	if err != nil {
+		if errors.Is(err, service.ErrSessionNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{
+				"error": gin.H{"code": "session_not_found", "message": "session not found"},
+			})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": gin.H{"code": "get_context_usage_failed", "message": err.Error()},
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, usage)
+}

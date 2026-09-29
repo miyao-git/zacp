@@ -35,6 +35,26 @@ type EventBridge struct {
 	// pendingPermissions 等待前端回传的权限请求（permissionID → 响应通道）。
 	// ACP 请求自身带 sessionId，因此多个 session 可独立挂起，不依赖 Agent 的单一当前会话。
 	pendingPermissions sync.Map
+
+	// 同会话消息排队（响应过程中继续发消息）：见 acquireTurnOrEnqueue。
+	promptQueueMu sync.Mutex
+	// activeTurns 该会话是否有一轮正在执行：覆盖到 turn.done 广播完成（而不止
+	// manager 返回），否则新 prompt 会抢在收尾前直接开跑，出现 turn.started
+	// 早于上一条 turn.done 的乱序广播，前端流式槽位会错位。
+	activeTurns map[string]bool
+	// promptQueues 各会话排队中的消息（FIFO；用户消息在入队前已落库）。
+	promptQueues map[string][]*queuedPrompt
+}
+
+// queuedPrompt 排队等待执行的用户消息。
+// 用户消息在入队前就已落库（立即进入对话序列），队列里只保留执行所需文本。
+type queuedPrompt struct {
+	text string
+}
+
+// promptQueueKey 会话级队列键：agent + ACP session id 唯一确定一个会话。
+func promptQueueKey(agentID, sessionID string) string {
+	return agentID + "\x00" + sessionID
 }
 
 // permissionTimeout 前端未响应权限请求的等待上限；超时自动取消，避免阻塞 agent turn。
@@ -52,6 +72,8 @@ func NewEventBridge(handler *Handler, mgr *manager.Manager, sessionRepo *store.S
 		msgRepo:         msgRepo,
 		log:             log,
 		promptOrderTail: ready,
+		activeTurns:     make(map[string]bool),
+		promptQueues:    make(map[string][]*queuedPrompt),
 	}
 }
 
@@ -71,10 +93,105 @@ func (b *EventBridge) newPromptOrderTicket() (<-chan struct{}, func()) {
 	return wait, release
 }
 
-// HasPromptInProgress 报告指定 ACP 会话是否处于 prompt 执行/排队中。
+// HasPromptInProgress 报告指定 ACP 会话是否处于 prompt 执行/排队中
+// （含「响应过程中继续发消息」产生的排队消息）。
 // 供 WS resync 查询：running=true 表示前端可恢复 streaming 续流。
 func (b *EventBridge) HasPromptInProgress(agentID, sessionID string) bool {
-	return b.manager.HasPromptInProgress(agentID, sessionID)
+	if b.manager.HasPromptInProgress(agentID, sessionID) {
+		return true
+	}
+	key := promptQueueKey(agentID, sessionID)
+	b.promptQueueMu.Lock()
+	defer b.promptQueueMu.Unlock()
+	return b.activeTurns[key] || len(b.promptQueues[key]) > 0
+}
+
+// acquireTurnOrEnqueue 原子判定该会话当前是否可以立刻执行一轮 prompt：
+//   - 空闲（无执行中的轮次、无排队消息）→ 登记占用并返回 run=true；
+//   - 繁忙（本会话已有 turn 在执行或排队，或 manager 层有其它入口的 turn）→
+//     消息入队等待接力执行，返回 run=false。
+//
+// 判定与登记在同一临界区内完成，避免「检查通过后、登记前」被其它帧插队。
+func (b *EventBridge) acquireTurnOrEnqueue(agentID, sessionID, text string) (run bool) {
+	key := promptQueueKey(agentID, sessionID)
+	b.promptQueueMu.Lock()
+	defer b.promptQueueMu.Unlock()
+	if b.activeTurns[key] || len(b.promptQueues[key]) > 0 ||
+		b.manager.HasPromptInProgress(agentID, sessionID) {
+		b.promptQueues[key] = append(b.promptQueues[key], &queuedPrompt{text: text})
+		return false
+	}
+	b.activeTurns[key] = true
+	return true
+}
+
+// finishTurnAndNext 结束本轮占用并取出下一条排队消息（原子）。
+// 下一条的占用在同一临界区内登记，保证「释放」与「接力」之间不会有新消息
+// 误判为空闲而并行执行（同会话永远只有一轮在跑）。
+func (b *EventBridge) finishTurnAndNext(agentID, sessionID string) *queuedPrompt {
+	key := promptQueueKey(agentID, sessionID)
+	b.promptQueueMu.Lock()
+	defer b.promptQueueMu.Unlock()
+	delete(b.activeTurns, key)
+	queue := b.promptQueues[key]
+	if len(queue) == 0 {
+		delete(b.promptQueues, key)
+		return nil
+	}
+	next := queue[0]
+	if len(queue) == 1 {
+		delete(b.promptQueues, key)
+	} else {
+		b.promptQueues[key] = queue[1:]
+	}
+	b.activeTurns[key] = true
+	return next
+}
+
+// queuedCount 返回该会话排队中的消息条数（日志/状态展示用）。
+func (b *EventBridge) queuedCount(agentID, sessionID string) int {
+	key := promptQueueKey(agentID, sessionID)
+	b.promptQueueMu.Lock()
+	defer b.promptQueueMu.Unlock()
+	return len(b.promptQueues[key])
+}
+
+// dropQueuedPrompts 清空该会话的排队消息（用户点停止：不再继续执行后续排队内容）。
+// 消息已落库保留在对话序列中，只是不再触发执行。
+func (b *EventBridge) dropQueuedPrompts(agentID, sessionID string) int {
+	key := promptQueueKey(agentID, sessionID)
+	b.promptQueueMu.Lock()
+	defer b.promptQueueMu.Unlock()
+	n := len(b.promptQueues[key])
+	delete(b.promptQueues, key)
+	return n
+}
+
+// chainNextQueued 释放本会话占用并接力执行下一条排队消息（无则什么都不做）。
+// 必须在本轮 turn.done 广播之后调用，保证前端看到的广播顺序是先收尾再开新轮。
+func (b *EventBridge) chainNextQueued(agentID, sessionID string) {
+	next := b.finishTurnAndNext(agentID, sessionID)
+	if next == nil {
+		return
+	}
+	b.log.Info("running queued prompt", "sessionID", sessionID, "remaining", b.queuedCount(agentID, sessionID))
+	go b.runQueuedTurn(agentID, sessionID, next.text)
+}
+
+// runQueuedTurn 执行一条排队消息：用户消息在入队时已落库，这里只跑 agent 轮次。
+// 用独立 ctx：浏览器断线/离开页面不应中断用户已明确排队的后续轮次。
+func (b *EventBridge) runQueuedTurn(agentID, sessionID, text string) {
+	dbSession, err := b.sessionRepo.GetByACPSessionID(sessionID)
+	if err != nil {
+		b.log.Error("queued prompt: session not found", "sessionID", sessionID, "err", err)
+		b.chainNextQueued(agentID, sessionID)
+		return
+	}
+	if err := b.runTurn(context.Background(), dbSession, agentID, sessionID, text, nil, nil); err != nil {
+		b.log.Error("queued prompt failed", "sessionID", sessionID, "err", err)
+		// 与 WS 入口同一口径：广播 error 让前端复位状态并提示原因
+		b.handler.BroadcastError(sessionID, "PROMPT_ERROR", err.Error())
+	}
 }
 
 // NewEventBridge 组装完成后，由调用方（cmd/server）注入「prompt 开始执行」钩子：
@@ -414,6 +531,8 @@ func deriveTitle(message string) string {
 // HandlePrompt 处理 WebSocket 的 prompt 消息（每帧一个 goroutine，可并发进入）。
 // 并发语义：全局最多 3 个 prompt 进入 ACP，更多请求按 FIFO 排队；
 // 不同 session 的事件、回复和权限按 ACP session id 隔离。
+// 同一 session 同一时刻只允许一轮在 ACP 上执行：响应过程中继续发来的消息
+// 落库后进入该会话的等待队列，由当前轮收尾时自动接力执行（见 acquireTurnOrEnqueue）。
 // 排队中的 prompt 被 Cancel 撤销时返回 ErrPromptCancelled，此处广播
 // turn.done(cancelled) 让前端复位「排队中」状态，不报错、不落库。
 //
@@ -421,7 +540,8 @@ func deriveTitle(message string) string {
 //  1. 按需启动 agent 进程
 //  2. 按 ACP session id 反查 DB 会话并落库用户消息（首条消息生成标题）
 //  3. 草稿转正
-//  4. 经 manager.Prompt 排队执行（事件回调由 onStarted 钩子注册）
+//  4. 会话空闲则经 manager.Prompt 排队执行（事件回调由 onStarted 钩子注册）；
+//     繁忙（已有轮次在执行/排队）则入队等待接力
 //  5. 落库助手回复、touch 会话（驱动侧栏排序），广播 turn.done
 //
 // HandlePrompt 处理一个不要求 WS 到达顺序的 prompt 调用（兼容 REST/测试调用方）。
@@ -476,6 +596,23 @@ func (b *EventBridge) handlePrompt(ctx context.Context, sessionID, agentID, mess
 		_ = b.sessionRepo.UpdateTitle(dbSession.ID, deriveTitle(message))
 	}
 
+	// 该会话已有 turn 在执行/排队（「响应过程中继续发消息」）：用户消息已落库
+	// 进入对话序列，这里入队等待本轮结束后自动接力执行，立即返回不阻塞 WS 帧；
+	// 前端在排队消息被真正执行时收到下一轮的 turn.started/事件流。
+	if !b.acquireTurnOrEnqueue(agentID, sessionID, message) {
+		b.log.Info("prompt queued behind running turn",
+			"sessionID", sessionID, "queued", b.queuedCount(agentID, sessionID))
+		return nil
+	}
+	return b.runTurn(ctx, dbSession, agentID, sessionID, message, wait, release)
+}
+
+// runTurn 执行一轮 prompt（用户消息已落库，调用方完成草稿转正/标题处理）。
+// 收尾（成功、取消、出错都算）无条件释放会话占用并接力下一条排队消息，
+// 否则该会话的队列会在异常路径上永久卡住。
+func (b *EventBridge) runTurn(ctx context.Context, dbSession *model.Session, agentID, sessionID, message string, wait <-chan struct{}, release func()) error {
+	defer b.chainNextQueued(agentID, sessionID)
+
 	if wait != nil {
 		select {
 		case <-wait:
@@ -528,8 +665,15 @@ func (b *EventBridge) handlePrompt(ctx context.Context, sessionID, agentID, mess
 	return nil
 }
 
-// HandleCancel 处理 WebSocket 的 cancel 消息
+// HandleCancel 处理 WebSocket 的 cancel 消息。
+// 停止语义（用户点停止 = 本会话到此为止）：
+//  1. 先清空该会话排队的消息（响应过程中发的消息不再接力执行；消息本身已落库，
+//     仍留在对话序列里，只是不再触发执行）；
+//  2. 再取消正在执行的那一轮（manager.Cancel：排队中撤销 FIFO 等待、执行中发 ACP cancel）。
 func (b *EventBridge) HandleCancel(ctx context.Context, sessionID, agentID string) error {
+	if n := b.dropQueuedPrompts(agentID, sessionID); n > 0 {
+		b.log.Info("dropped queued prompts on cancel", "sessionID", sessionID, "count", n)
+	}
 	// 与 HandlePrompt 一致：先确保 agent 已启动（幂等），避免对未启动
 	// agent 的旧会话发 cancel 时报 "agent not started"。
 	if err := b.manager.EnsureStarted(ctx, agentID); err != nil {

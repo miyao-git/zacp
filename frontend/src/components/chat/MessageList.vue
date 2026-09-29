@@ -1,12 +1,13 @@
 <script setup lang="ts">
-import { computed, nextTick, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { ThemeProvider } from '@incremark/vue'
-import { ChevronDownOutline, ChevronUpOutline } from '@vicons/ionicons5'
+import { ChevronDownOutline } from '@vicons/ionicons5'
 import { useSessionStore } from '@/stores/session'
 import { useAppStore } from '@/stores/app'
 import { useChatScroll } from '@/composables/useChatScroll'
 import MessageItem from '@/components/chat/MessageItem.vue'
+import MessageNavRail from '@/components/chat/MessageNavRail.vue'
 import PermissionModal from '@/components/chat/PermissionModal.vue'
 
 const { t } = useI18n()
@@ -14,7 +15,7 @@ const sessionStore = useSessionStore()
 const appStore = useAppStore()
 
 const scroller = ref<HTMLElement | null>(null)
-const { atTop, atBottom, onScroll, scrollToBottom, snapToBottom, followIfAtBottom, scrollUp, scrollDown } =
+const { atBottom, onScroll, scrollToBottom, snapToBottom, followIfAtBottom } =
   useChatScroll(scroller)
 
 /** 消息列表变化信号：长度（追加/刷新）或最后一条内容（流式追加）变化时触发跟随 */
@@ -86,13 +87,175 @@ watch(
     }
   },
 )
+
+// ---------------------------------------------------------------------------
+// 用户消息导航条（右侧横杠 + hover 预览，替代原「回到顶部/底部」双按钮）
+// ---------------------------------------------------------------------------
+
+/** 视口顶部下方的判定带：距容器顶 48px 内即视为「该消息已进入阅读位置」 */
+const ACTIVE_NAV_OFFSET_PX = 48
+/** 跳转后在目标消息上方保留的余量（避免标题紧贴容器上沿） */
+const JUMP_TOP_MARGIN_PX = 12
+
+/** 导航项：用户消息按时间升序；preview 取首个非空行（超长交给 CSS 截断） */
+const userNavItems = computed(() => {
+  const items: { id: number; preview: string }[] = []
+  for (const m of sessionStore.activeMessages) {
+    if (m.role !== 'user') {
+      continue
+    }
+    const firstLine = (m.content ?? '')
+      .split('\n')
+      .map((line) => line.trim())
+      .find((line) => line.length > 0)
+    if (firstLine) {
+      items.push({ id: m.id, preview: firstLine })
+    }
+  }
+  return items
+})
+
+/** 当前阅读位置对应的导航下标（-1 = 未定位） */
+const activeNavIndex = ref(-1)
+
+/**
+ * 重算当前项：取「元素顶边已越过视口顶部判定带」的最后一条用户消息。
+ * 元素通过 data-msg-id 与导航项按 id 对齐（跳过被过滤掉的空消息），
+ * DOM 顺序即时间顺序，因此可直接线性扫描。
+ */
+function updateActiveNavIndex() {
+  const el = scroller.value
+  if (!el) {
+    return
+  }
+  const indexById = new Map(userNavItems.value.map((item, i) => [item.id, i]))
+  const threshold = el.getBoundingClientRect().top + ACTIVE_NAV_OFFSET_PX
+  let active = -1
+  for (const node of el.querySelectorAll<HTMLElement>('[data-msg-id]')) {
+    const index = indexById.get(Number(node.dataset.msgId))
+    if (index === undefined) {
+      continue
+    }
+    if (node.getBoundingClientRect().top <= threshold) {
+      active = index
+    }
+  }
+  activeNavIndex.value = active
+}
+
+/** 跳转到第 index 条用户消息（平滑滚动） */
+function jumpToUserMessage(index: number) {
+  const el = scroller.value
+  const item = userNavItems.value[index]
+  if (!el || !item) {
+    return
+  }
+  const node = el.querySelector<HTMLElement>(`[data-msg-id="${item.id}"]`)
+  if (!node) {
+    return
+  }
+  const top = node.getBoundingClientRect().top - el.getBoundingClientRect().top + el.scrollTop
+  el.scrollTo({ top: Math.max(0, top - JUMP_TOP_MARGIN_PX), behavior: 'smooth' })
+}
+
+/** rAF 节流：滚动事件密集，当前项重算涉及整表 rect 读取，每帧最多一次 */
+let navUpdateFrame = 0
+function scheduleActiveNavUpdate() {
+  if (navUpdateFrame) {
+    return
+  }
+  navUpdateFrame = requestAnimationFrame(() => {
+    navUpdateFrame = 0
+    updateActiveNavIndex()
+  })
+}
+
+// 消息变化（追加/流式/切换会话）后当前项同样会变：列表长度、最后一条内容与当前会话 id 作信号
+watch(
+  () => [
+    sessionStore.currentId,
+    sessionStore.activeMessages.length,
+    sessionStore.activeMessages.at(-1)?.content.length ?? 0,
+  ],
+  () => {
+    void nextTick(() => scheduleActiveNavUpdate())
+  },
+)
+
+onMounted(() => scheduleActiveNavUpdate())
+
+// ---------------------------------------------------------------------------
+// 滚动条宽度同步
+//
+// 消息列在滚动容器内（经典滚动条占 10~17px 布局宽度），底部输入条不在滚动容器里；
+// 两者都 mx-auto 居中时，消息列会整体偏向滚动条相反方向半个滚动条宽，看起来
+// 「输入框与消息记录没对齐」。这里把实测宽度写进 CSS 变量，输入条容器按同宽度
+// 收窄（见 main.css 的 .composer-shell），使两者可用宽度与中心完全一致。
+// 滚动条出现/消失/变宽都会改变 clientWidth（内容盒）→ ResizeObserver 即可感知。
+// ---------------------------------------------------------------------------
+
+let scrollbarObserver: ResizeObserver | null = null
+
+/** 同步消息区滚动条宽度到全局 CSS 变量（值不变不写，避免无谓的样式重算） */
+function syncScrollbarWidth() {
+  const el = scroller.value
+  if (!el) {
+    return
+  }
+  const width = Math.max(0, el.offsetWidth - el.clientWidth)
+  const next = `${width}px`
+  if (document.documentElement.style.getPropertyValue('--msg-scrollbar-w') !== next) {
+    document.documentElement.style.setProperty('--msg-scrollbar-w', next)
+  }
+}
+
+onMounted(() => {
+  syncScrollbarWidth()
+  scrollbarObserver = new ResizeObserver(() => syncScrollbarWidth())
+  if (scroller.value) {
+    scrollbarObserver.observe(scroller.value)
+  }
+})
+
+// ---------------------------------------------------------------------------
+// 「回到底部」悬浮按钮：滚动时浮现，停止滚动 0.6s 后淡出（避免长期遮挡内容）
+// ---------------------------------------------------------------------------
+
+/** 停止滚动后按钮的停留时长：留一点余量方便「滚一下再点」，又不会长期挡住内容 */
+const SCROLL_IDLE_HIDE_MS = 600
+const jumpButtonVisible = ref(false)
+let jumpButtonTimer: ReturnType<typeof setTimeout> | undefined
+
+/** 滚动统一入口：贴底判定 + 按钮浮现 + 当前导航项重算 */
+function handleScroll() {
+  onScroll()
+  jumpButtonVisible.value = true
+  clearTimeout(jumpButtonTimer)
+  jumpButtonTimer = setTimeout(() => {
+    jumpButtonVisible.value = false
+  }, SCROLL_IDLE_HIDE_MS)
+  scheduleActiveNavUpdate()
+}
+
+onBeforeUnmount(() => {
+  clearTimeout(jumpButtonTimer)
+  if (navUpdateFrame) {
+    cancelAnimationFrame(navUpdateFrame)
+  }
+  scrollbarObserver?.disconnect()
+  scrollbarObserver = null
+})
 </script>
 
 <template>
-  <!-- 外层 relative + h-full：为右侧悬浮按钮提供视口锚点，滚动容器在内部 -->
+  <!-- 外层 relative + h-full：为右侧导航条/回到底部按钮提供视口锚点，滚动容器在内部 -->
   <div class="relative h-full min-h-0">
-    <div ref="scroller" class="h-full overflow-y-auto" @scroll="onScroll">
-      <div class="content-container flex flex-col gap-4 px-4 py-6">
+    <div ref="scroller" class="h-full overflow-y-auto" @scroll="handleScroll">
+      <!-- 左右内边距与底部输入条一致（px-3 lg:px-0）：消息列与输入框卡片同宽，
+           工具卡/正文的左右边缘与输入框描边对齐；safe-area 由外层容器承担。
+           底部额外留白 = 悬浮输入层高度（--composer-h，由 ChatPane 实测写入）：
+           输入条浮在消息之上，最后一条消息要能滚到它上方，不被永久遮住。 -->
+      <div class="content-container flex flex-col gap-4 px-3 pt-6 pb-[calc(var(--composer-h,6rem)_+_1.5rem)] lg:px-0">
         <!-- ThemeProvider 把当前主题注入 incremark 渲染上下文：
              驱动 shiki 代码高亮在 github-light / github-dark 之间切换（CSS 层的
              data-theme 属性只影响代码块背景/容器色，token 颜色必须靠这个上下文）。
@@ -144,25 +307,28 @@ watch(
       <PermissionModal />
     </div>
 
-    <!-- 右侧上下滚动按钮（替代原输入框上方回到底部按钮） -->
-    <!-- 悬浮于外层视口、垂直居中，不随内部滚动而移动；小尺寸圆形，亮/暗色均用语义 token -->
-    <div class="absolute right-2 top-1/2 z-10 flex -translate-y-1/2 flex-col gap-1.5 lg:right-4">
-      <button
-        class="flex h-7 w-7 cursor-pointer items-center justify-center rounded-full border border-divider bg-surface-raised/90 text-ink-muted shadow-sm backdrop-blur transition-colors hover:bg-surface-hover hover:text-ink disabled:pointer-events-none disabled:opacity-40"
-        :aria-label="t('chat.scrollUp')"
-        :disabled="atTop"
-        @click="scrollUp()"
-      >
-        <n-icon :size="14"><ChevronUpOutline /></n-icon>
-      </button>
-      <button
-        class="flex h-7 w-7 cursor-pointer items-center justify-center rounded-full border border-divider bg-surface-raised/90 text-ink-muted shadow-sm backdrop-blur transition-colors hover:bg-surface-hover hover:text-ink disabled:pointer-events-none disabled:opacity-40"
-        :aria-label="t('chat.scrollDown')"
-        :disabled="atBottom"
-        @click="scrollDown()"
-      >
-        <n-icon :size="14"><ChevronDownOutline /></n-icon>
-      </button>
-    </div>
+    <!-- 用户消息导航条：折叠态只显示横杠（当前项深色），hover 展开预览并可点击跳转；
+         用户消息 ≤ 1 条时组件内部不渲染 -->
+    <MessageNavRail
+      :items="userNavItems"
+      :active-index="activeNavIndex"
+      @jump="jumpToUserMessage"
+    />
+
+    <!-- 「回到底部」悬浮按钮：位于对话框正上方居中，样式沿用原回到最底按钮；
+         仅在滚动时浮现（停止滚动 0.6s 后淡出），且已贴底时无意义 → 始终隐藏。
+         bottom 偏移加悬浮输入层高度，避免被输入条盖住（--composer-h 由 ChatPane 写入） -->
+    <button
+      class="absolute bottom-[calc(var(--composer-h,6rem)_+_0.75rem)] left-1/2 z-10 flex h-7 w-7 -translate-x-1/2 cursor-pointer items-center justify-center rounded-full border border-divider bg-surface-raised/90 text-ink-muted shadow-sm backdrop-blur transition-opacity duration-200 hover:bg-surface-hover hover:text-ink"
+      :class="
+        jumpButtonVisible && !atBottom
+          ? 'opacity-100'
+          : 'pointer-events-none opacity-0'
+      "
+      :aria-label="t('chat.scrollDown')"
+      @click="scrollToBottom(true)"
+    >
+      <n-icon :size="14"><ChevronDownOutline /></n-icon>
+    </button>
   </div>
 </template>

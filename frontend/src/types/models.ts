@@ -278,6 +278,18 @@ export interface MessagePage {
   offset: number
 }
 
+/**
+ * 会话上下文用量（GET /sessions/:id/context-usage，对齐后端 model.ContextUsageDTO）。
+ * 估算值：ACP 不提供真实用量（agent 未必上报 usage_update），后端按会话消息内容折算，
+ * 分母为 agents[].context_window（未配置回退默认窗口）。
+ */
+export interface ContextUsage {
+  usedTokens: number
+  windowTokens: number
+  /** 占用百分比（0-100，后端已封顶） */
+  percent: number
+}
+
 /** 增量消息响应（afterId 模式；仅包含指定消息之后新增的记录） */
 export interface MessageUpdates {
   messages: ChatMessage[]
