@@ -164,6 +164,35 @@ func (h *SessionHandler) ListRecentSessions(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"sessions": sessions})
 }
 
+// SearchSessions 搜索会话（标题 + 对话正文，跨项目）
+// GET /api/v1/sessions/search?q=<关键词>&limit=20
+// 搜索口径（正文不含思考过程与工具调用）见 service.SearchSessions；
+// 关键词过长返回 400 invalid_query，空关键词返回空结果（不报错）。
+func (h *SessionHandler) SearchSessions(c *gin.Context) {
+	limit := 0
+	if l := c.Query("limit"); l != "" {
+		if parsed, err := strconv.Atoi(l); err == nil && parsed > 0 {
+			limit = parsed
+		}
+	}
+
+	result, err := h.svc.SearchSessions(c.Query("q"), limit)
+	if err != nil {
+		if errors.Is(err, service.ErrInvalidArgument) {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error": gin.H{"code": "invalid_query", "message": err.Error()},
+			})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": gin.H{"code": "search_sessions_failed", "message": err.Error()},
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, result)
+}
+
 // GetConfigOptions 获取会话配置项（模型/思考强度/mode 等）
 // GET /api/v1/sessions/:id/config-options
 func (h *SessionHandler) GetConfigOptions(c *gin.Context) {

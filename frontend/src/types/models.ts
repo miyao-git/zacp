@@ -227,6 +227,32 @@ export interface ChatSession {
   workspace?: Workspace
 }
 
+/** 会话搜索的正文命中片段（GET /api/v1/sessions/search） */
+export interface SessionSearchSnippet {
+  /** 所在消息 id（预留：后续可支持「跳到该消息」） */
+  messageId: number
+  role: MessageRole
+  /** 已由后端折叠空白 + 按字符截断的上下文片段（高亮由前端 splitByKeyword 处理） */
+  text: string
+}
+
+/** 会话搜索命中项；titleMatch=true 的全部在前，其后为仅正文命中（排序不变式见后端） */
+export interface SessionSearchResult {
+  session: ChatSession
+  titleMatch: boolean
+  /** 命中的消息条数（非关键词出现次数）；0 = 仅标题命中 */
+  contentHitCount: number
+  /** 正文片段，每会话最多 3 条（消息由新到旧） */
+  snippets: SessionSearchSnippet[]
+}
+
+/** 会话搜索结果（搜索口径：标题 + 对话正文，不含思考过程与工具调用） */
+export interface SessionSearchResponse {
+  results: SessionSearchResult[]
+  /** true = 命中过多被条数上限截断，前端提示细化关键词 */
+  truncated: boolean
+}
+
 /** 消息角色（后端 model.Message.Role） */
 export type MessageRole = 'user' | 'assistant' | 'system'
 

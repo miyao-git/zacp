@@ -15,6 +15,7 @@ import { useSessionStore } from '@/stores/session'
 import { useAppStore } from '@/stores/app'
 import type { ChatSession, Workspace } from '@/types/models'
 import SessionListItem from '@/components/shell/SessionListItem.vue'
+import { projectName } from '@/utils/workspace'
 
 const { t } = useI18n()
 const route = useRoute()
@@ -378,11 +379,6 @@ function toggleWorkspace(id: number) {
     void sessionStore.loadSessionsByWorkspace(id)
   }
   expandedIds.value = next
-}
-
-/** 项目显示名：优先用 workspace.name（后端取末尾段填充） */
-function projectName(ws: Workspace): string {
-  return ws.name || ws.path.split('/').pop() || ws.path
 }
 
 /** 在该项目下新建会话：进入 /new?workspaceId=X 空态 */

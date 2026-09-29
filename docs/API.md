@@ -194,6 +194,67 @@ GET /sessions?limit=50
 }
 ```
 
+### 搜索会话（标题 + 对话正文，跨项目）
+
+```
+GET /sessions/search?q=关键词&limit=20
+```
+
+**查询参数**:
+- `q`: 关键词，必填；`TrimSpace` 后为空返回空结果（200，不报错），超过 64 个字符返回 `400 invalid_query`
+- `limit`: 标题段 / 内容段各自的会话条数上限，默认 20，夹取 1~50
+
+**搜索口径**: 标题 + 对话正文。正文只匹配 `messages.content`
+（用户输入与助手最终回复），**不含思考过程（events.agent_thought）与工具调用（tool_details）**。
+草稿会话、以及所属项目已被移除（软删除）的会话不参与搜索。
+
+**排序不变式**: `titleMatch=true` 的结果全部在前（各自 `updatedAt` 倒序），
+随后是仅正文命中的结果（同样 `updatedAt` 倒序）；同一会话只出现一次。
+
+**响应**:
+```json
+{
+  "results": [
+    {
+      "session": {
+        "id": 1,
+        "workspaceId": 1,
+        "agentId": "reasonix",
+        "title": "会话标题",
+        "status": "active",
+        "createdAt": "2025-01-21T10:30:00Z",
+        "updatedAt": "2025-01-21T10:35:00Z",
+        "workspace": { "id": 1, "path": "/home/user/project", "name": "my-project" }
+      },
+      "titleMatch": true,
+      "contentHitCount": 0,
+      "snippets": []
+    },
+    {
+      "session": { "id": 2, "title": "另一个会话", "workspace": { "id": 1, "name": "my-project" } },
+      "titleMatch": false,
+      "contentHitCount": 4,
+      "snippets": [
+        {
+          "messageId": 88,
+          "role": "assistant",
+          "text": "…折叠空白后的上下文片段（命中词前后各约 40 字）…"
+        }
+      ]
+    }
+  ],
+  "truncated": false
+}
+```
+
+**说明**:
+- 两段互斥：标题命中的会话不进内容段（因此其 `contentHitCount=0`、`snippets=[]`），
+  既避免重复展示，也避免标题命中过多时挤空内容段
+- `contentHitCount` 是命中的**消息条数**（非关键词出现次数）；`snippets` 每会话最多 3 条（消息由新到旧）
+- `truncated=true` 表示命中过多被 `limit` 截断（标题段 / 内容段各自判断），前端提示细化关键词
+- 实现为 SQLite `LIKE '%关键词%'` 全表扫描（当前数据量毫秒级，无需 FTS5/索引）；
+  正文总量到 ~100MB 量级时再评估全文索引，见 `service.SearchSessions` 注释
+
 ### 删除会话
 
 ```

@@ -43,6 +43,7 @@ import type {
   MessagePage,
   MessageThoughts,
   MessageUpdates,
+  SessionSearchResponse,
   VersionInfo,
   Workspace,
   ZliteChannel,
@@ -513,6 +514,23 @@ export async function fetchSessionsByWorkspace(
     { query: { limit, offset } },
   )
   return data.sessions
+}
+
+/**
+ * GET /api/v1/sessions/search — 跨项目搜索会话（标题 + 对话正文）。
+ * 正文只匹配用户输入与助手最终回复，不含思考过程与工具调用；
+ * limit 为标题段/内容段各自的会话条数上限（后端夹取 1~50）。
+ * signal 用于输入变化时中止在途请求（配合去抖，避免乱序覆盖）。
+ */
+export async function searchSessions(
+  query: string,
+  limit = 20,
+  signal?: AbortSignal,
+): Promise<SessionSearchResponse> {
+  return http.get<SessionSearchResponse>('/api/v1/sessions/search', {
+    query: { q: query, limit },
+    signal,
+  })
 }
 
 /** GET /api/v1/sessions/:id — 会话详情；signal 可用于超时/离开页面时中止请求 */

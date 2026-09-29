@@ -133,6 +133,9 @@ func New(
 			// 会话管理
 			authed.POST("/sessions", sessionHandler.CreateSession)
 			authed.GET("/sessions", sessionHandler.ListRecentSessions)
+			// 会话搜索（标题 + 对话正文，跨项目）：静态段 search 与 /sessions/:id 同层共存，
+			// gin v1.12 静态优先匹配（与 /agents/manage、/workspaces/order 同类先例），不会落到 :id
+			authed.GET("/sessions/search", sessionHandler.SearchSessions)
 			authed.GET("/sessions/:id", sessionHandler.GetSession)
 			authed.PATCH("/sessions/:id", sessionHandler.RenameSession)
 			authed.DELETE("/sessions/:id", sessionHandler.DeleteSession)

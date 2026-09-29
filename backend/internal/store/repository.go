@@ -236,6 +236,36 @@ func (r *SessionRepository) ListRecent(limit int) ([]model.Session, error) {
 	return sessions, err
 }
 
+// SearchByTitle 按关键词搜索会话标题（跨工作区，预加载 Workspace 供前端显示项目名）。
+//
+// 过滤规则与侧栏一致：草稿会话、以及所属项目已被移除（软删除）的会话都不返回，
+// 否则搜索结果里会出现侧栏无法归组的孤儿条目。
+// 大小写语义跟随 SQLite LIKE：ASCII 不敏感、CJK 精确匹配（无需额外处理）。
+// limit 由调用方决定（service 传 limit+1 用于判断结果是否被截断）。
+func (r *SessionRepository) SearchByTitle(keyword string, limit int) ([]model.Session, error) {
+	var sessions []model.Session
+	err := r.db.Preload("Workspace").
+		Where("is_draft = ?", false).
+		// 子查询由 GORM 生成，自动带 workspaces.deleted_at IS NULL
+		Where("workspace_id IN (?)", r.db.Model(&model.Workspace{}).Select("id")).
+		Where(`title LIKE ? ESCAPE '\'`, "%"+escapeLike(keyword)+"%").
+		Order("updated_at DESC, id DESC").
+		Limit(limit).
+		Find(&sessions).Error
+	return sessions, err
+}
+
+// ListByIDs 按 id 批量获取会话（预加载 Workspace）。
+// 用于正文搜索命中的会话补齐会话行：返回顺序不保证，调用方按自己的顺序取用。
+func (r *SessionRepository) ListByIDs(ids []uint) ([]model.Session, error) {
+	if len(ids) == 0 {
+		return []model.Session{}, nil
+	}
+	var sessions []model.Session
+	err := r.db.Preload("Workspace").Where("id IN ?", ids).Find(&sessions).Error
+	return sessions, err
+}
+
 // Update 更新会话
 func (r *SessionRepository) Update(session *model.Session) error {
 	return r.db.Save(session).Error
@@ -393,6 +423,75 @@ func (r *MessageRepository) ListBySessionAfterID(sessionID, afterID uint) ([]mod
 		Order("id ASC").
 		Find(&messages).Error
 	return messages, err
+}
+
+// ContentSearchRow 正文搜索命中的单条消息（只投影必要列）。
+// 刻意不含 events / tool_details：这两列合计占库体积约九成，且搜索口径明确不看
+// 思考过程与工具调用（两者都只存在于这两列中，正文只在 messages.content）。
+type ContentSearchRow struct {
+	SessionID        uint      `gorm:"column:session_id"`
+	HitCount         int       `gorm:"column:hit_count"` // 该会话命中的消息条数（非关键词出现次数）
+	MessageID        uint      `gorm:"column:message_id"`
+	Role             string    `gorm:"column:role"`
+	Content          string    `gorm:"column:content"`
+	SessionUpdatedAt time.Time `gorm:"column:session_updated_at"`
+}
+
+// searchContentInnerSelect 正文搜索的内层查询（窗口函数见 SearchContentHits 注释）。
+const searchContentInnerSelect = `
+	m.session_id  AS session_id,
+	m.id          AS message_id,
+	m.role        AS role,
+	m.content     AS content,
+	s.updated_at  AS session_updated_at,
+	COUNT(*)     OVER (PARTITION BY m.session_id)                     AS hit_count,
+	ROW_NUMBER() OVER (PARTITION BY m.session_id ORDER BY m.id DESC)  AS rn,
+	DENSE_RANK() OVER (ORDER BY s.updated_at DESC, m.session_id DESC) AS session_rank`
+
+// SearchContentHits 搜索消息正文，每个会话最多返回 perSession 条命中消息（由新到旧）。
+//
+// excludeSessionIDs 为标题已命中的会话（调用方排除，避免「标题段」与「内容段」重复，
+// 也避免标题命中过多的会话把内容段的会话预算挤空）。
+// maxSessions 是内容段会话数预算（调用方传 limit+1，多取的 1 个用于判断是否被截断）。
+//
+// 设计要点（改这里前请先读）：
+//   - 窗口函数（SQLite 3.41 支持）解决「单个高频会话吃光结果预算」：若直接
+//     `ORDER BY m.id DESC LIMIT 300`，一个会话就可能有 300 条命中，其它会话全部消失。
+//     ROW_NUMBER 取每个会话最近 perSession 条，COUNT 给出该会话精确命中条数，
+//     DENSE_RANK 给出会话序号用于按会话数截断——三者都在排除标题命中会话之后的集合上计算，
+//     因此截断判断与顺序都不受标题段影响。
+//   - 排序键 (updated_at, session_id) 对每个会话唯一，同会话各行的 DENSE_RANK 必然相同。
+//   - 只 SELECT 必要列，见 ContentSearchRow 注释。
+func (r *MessageRepository) SearchContentHits(keyword string, excludeSessionIDs []uint, perSession, maxSessions int) ([]ContentSearchRow, error) {
+	if perSession <= 0 {
+		perSession = 1
+	}
+	if maxSessions <= 0 {
+		maxSessions = 1
+	}
+
+	inner := r.db.Table("messages m").
+		Select(searchContentInnerSelect).
+		Joins("JOIN sessions s ON s.id = m.session_id").
+		Where("s.is_draft = ?", false).
+		Where("s.deleted_at IS NULL").
+		Where("s.workspace_id IN (?)", r.db.Model(&model.Workspace{}).Select("id")).
+		Where(`m.content LIKE ? ESCAPE '\'`, "%"+escapeLike(keyword)+"%")
+	if len(excludeSessionIDs) > 0 {
+		inner = inner.Where("m.session_id NOT IN ?", excludeSessionIDs)
+	}
+
+	rows := make([]ContentSearchRow, 0, (maxSessions+1)*perSession)
+	err := r.db.Table("(?) AS t", inner).
+		Select("t.session_id, t.hit_count, t.message_id, t.role, t.content, t.session_updated_at").
+		Where("t.rn <= ?", perSession).
+		Where("t.session_rank <= ?", maxSessions+1).
+		Order("t.session_updated_at DESC, t.session_id DESC, t.message_id DESC").
+		Scan(&rows).Error
+	if err != nil {
+		return nil, err
+	}
+	return rows, nil
 }
 
 // CountBySession 统计会话消息数量

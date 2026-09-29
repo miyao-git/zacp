@@ -2,9 +2,10 @@
 import { computed, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useRouter } from 'vue-router'
-import { AddOutline } from '@vicons/ionicons5'
+import { AddOutline, SearchOutline } from '@vicons/ionicons5'
 import { useMessage } from 'naive-ui'
 import SidebarSessionList from '@/components/shell/SidebarSessionList.vue'
+import SidebarSearchResults from '@/components/shell/SidebarSearchResults.vue'
 import UserFooter from '@/components/shell/UserFooter.vue'
 import DirectoryPicker from '@/components/shell/DirectoryPicker.vue'
 import { useSessionStore, MAX_WORKSPACES } from '@/stores/session'
@@ -33,6 +34,28 @@ const { dragging: resizing, onPointerDown: onResizeStart } = usePanelResize(
   (clientX) => clientX - (asideRef.value?.getBoundingClientRect().left ?? Number.NaN),
   (width) => appStore.setLeftSidebarWidth(width),
 )
+
+/**
+ * 侧栏搜索关键词：非空时用搜索结果面板替换会话树（搜索走服务端接口，
+ * 因为会话是按项目分页懒加载的，未展开项目的会话不在前端内存里）。
+ * 会话树用 v-show 隐藏而非卸载：保住各项目的展开状态与「查看更多」进度。
+ */
+const searchQuery = ref('')
+const searchActive = computed(() => searchQuery.value.trim().length > 0)
+
+/** 清空搜索（输入框清除按钮 / Esc）：回到分组会话树 */
+function clearSearch() {
+  searchQuery.value = ''
+}
+
+/**
+ * 搜索框尺寸对齐「新建项目」按钮：
+ * - 圆角 8px = 按钮的 rounded-lg；
+ * - 高度 38px = 按钮 py-2*2 + text-sm 行高 20px + 上下各 1px 边框；
+ * - 横向内边距沿用 medium 默认的 0 12px（等于按钮的 px-3）。
+ * Naive 默认 small 输入框是 28px 高、圆角 3px，比按钮矮且方，看着不像同一组控件。
+ */
+const searchInputTheme = { borderRadius: '8px', heightMedium: '38px' }
 
 /** 新建项目弹窗（与 WelcomeHero 共享 appStore.newProjectModalOpen） */
 const showProjectModal = ref(false)
@@ -110,13 +133,13 @@ async function onCreateProject() {
     :style="desktop ? { width: appStore.leftSidebarEffectiveWidth + 'px' } : undefined"
     :inert="!open && !desktop"
   >
-    <div class="flex items-center gap-1 pt-[max(env(safe-area-inset-top),0.75rem)] pl-[max(env(safe-area-inset-left),0.75rem)] pr-3 pb-3">
+    <div class="flex flex-col gap-2 pt-[max(env(safe-area-inset-top),0.75rem)] pl-[max(env(safe-area-inset-left),0.75rem)] pr-3 pb-3">
       <!-- 新建项目：Tailwind 实现的次级按钮（点击打开与 WelcomeHero 共享的项目弹窗）。
            注意：不做单独的抽屉关闭按钮——点遮罩区域即可关闭（移动端交互更轻）
            超过 MAX_WORKSPACES 时按钮禁用并提示 -->
       <button
         type="button"
-        class="flex cursor-pointer flex-1 items-center justify-center gap-1.5 rounded-lg border border-divider bg-surface-raised px-3 py-2 text-sm font-medium transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-divider disabled:cursor-not-allowed disabled:opacity-50"
+        class="flex w-full cursor-pointer items-center justify-center gap-1.5 rounded-lg border border-divider bg-surface-raised px-3 py-2 text-sm font-medium transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-divider disabled:cursor-not-allowed disabled:opacity-50"
         :class="canAddProject ? 'text-ink-secondary shadow-sm hover:border-divider hover:bg-surface-hover' : 'text-ink-muted'"
         :title="!canAddProject ? `项目数量已达上限（${MAX_WORKSPACES}个）` : undefined"
         @click="onNewProject"
@@ -124,9 +147,34 @@ async function onCreateProject() {
         <AddOutline class="h-4 w-4 shrink-0" />
         {{ t('shell.newProject') }}
       </button>
+
+      <!-- 会话搜索：标题 + 对话正文（跨项目）。中文输入法组字期间 NInput 不发
+           update:value，去抖请求只会在选词/确认后触发，无需额外处理 -->
+      <n-input
+        v-model:value="searchQuery"
+        size="medium"
+        clearable
+        :maxlength="64"
+        :placeholder="t('shell.searchPlaceholder')"
+        :aria-label="t('shell.searchPlaceholder')"
+        :theme-overrides="searchInputTheme"
+        @clear="clearSearch"
+        @keydown.esc="clearSearch"
+      >
+        <template #prefix>
+          <n-icon :size="16" class="text-ink-muted"><SearchOutline /></n-icon>
+        </template>
+      </n-input>
     </div>
 
-    <SidebarSessionList class="min-h-0 flex-1 overflow-y-auto px-3 pb-4" />
+    <!-- 搜索结果（query 非空时接管列表区；每次搜索都是全新面板，用 v-if 重建状态） -->
+    <SidebarSearchResults
+      v-if="searchActive"
+      class="min-h-0 flex-1 overflow-y-auto px-3 pb-4"
+      :query="searchQuery"
+    />
+    <!-- 分组会话树：v-show 隐藏而非卸载，保住项目展开状态与分页进度 -->
+    <SidebarSessionList v-show="!searchActive" class="min-h-0 flex-1 overflow-y-auto px-3 pb-4" />
     <UserFooter @open-settings="emit('open-settings')" />
 
     <!-- 拖拽调宽手柄（仅桌面端；移动端抽屉不参与）。

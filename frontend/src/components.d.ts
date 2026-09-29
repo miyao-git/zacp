@@ -74,6 +74,8 @@ declare module 'vue' {
     SessionInfo: typeof import('./components/files/SessionInfo.vue')['default']
     SessionListItem: typeof import('./components/shell/SessionListItem.vue')['default']
     SettingsModal: typeof import('./components/shell/SettingsModal.vue')['default']
+    SidebarSearchResultItem: typeof import('./components/shell/SidebarSearchResultItem.vue')['default']
+    SidebarSearchResults: typeof import('./components/shell/SidebarSearchResults.vue')['default']
     SidebarSessionList: typeof import('./components/shell/SidebarSessionList.vue')['default']
     SystemSettings: typeof import('./components/shell/SystemSettings.vue')['default']
     ToolCallCard: typeof import('./components/chat/ToolCallCard.vue')['default']

@@ -34,6 +34,33 @@ type ContextUsageDTO struct {
 	Percent      int `json:"percent"`      // 占用百分比（0-100，封顶）
 }
 
+// SessionSearchSnippetDTO 会话搜索的正文命中片段（仅正文命中的条目录入，标题命中不重复展示）。
+type SessionSearchSnippetDTO struct {
+	MessageID uint   `json:"messageId"` // 所在消息 id（预留：后续可支持「跳到该消息」）
+	Role      string `json:"role"`      // user | assistant
+	Text      string `json:"text"`      // 已折叠空白并做 rune 安全截断的上下文片段（高亮由前端做）
+}
+
+// SessionSearchResultDTO 会话搜索命中项（GET /api/v1/sessions/search）。
+// 排序不变式：TitleMatch=true 的全部在前（各自 updatedAt 倒序），随后是仅正文命中的
+// 会话（同样按 updatedAt 倒序）；两段互斥，同一会话只出现一次（标题命中优先，
+// 因此标题命中的条目不带正文片段）。
+type SessionSearchResultDTO struct {
+	Session         Session                   `json:"session"`         // 含预加载 Workspace，前端据此显示项目名
+	TitleMatch      bool                      `json:"titleMatch"`      // 标题命中
+	ContentHitCount int                       `json:"contentHitCount"` // 命中的消息条数（非关键词出现次数）；0 = 仅标题命中
+	Snippets        []SessionSearchSnippetDTO `json:"snippets"`        // 正文片段，每会话最多 3 条（消息由新到旧）
+}
+
+// SessionSearchResponseDTO 会话搜索结果（GET /api/v1/sessions/search）。
+// 搜索口径：标题 + 对话正文（只匹配 messages.content = 用户输入与助手最终回复），
+// 不含思考过程与工具调用。
+type SessionSearchResponseDTO struct {
+	Results []SessionSearchResultDTO `json:"results"` // 恒非 nil（无结果时为空数组）
+	// Truncated 命中过多被条数上限截断（标题段/正文段各自上限），前端提示细化关键词
+	Truncated bool `json:"truncated"`
+}
+
 // SessionModeDTO 兼容旧版 session modes。
 type SessionModeDTO struct {
 	ID          string `json:"id"`
