@@ -180,15 +180,20 @@ Examples:
 
 	// 仅预启动配置中第一个（最顶部）enabled 的 agent，保证空态有可用 agent；
 	// 其余 agent 按需启动：前端切换 agent 建会话时经 service 自动拉起。
-	ctx := context.Background()
-	if ids := registry.List(); len(ids) > 0 {
-		preloadID := ids[0]
-		if err := mgr.StartAgent(ctx, preloadID); err != nil {
-			log.Warn("failed to preload agent", "agent", preloadID, "err", err)
-		} else {
-			log.Info("agent preloaded", "agent", preloadID)
+	// 必须异步：agent 冷启动（qodercli 的 ACP 握手实测 ~4.3s）若同步等待，
+	// HTTP 监听会被一并拖延（实测启动从 ~0.1s 变 ~4.4s）；后台预热期间
+	// 建会话由 EnsureStarted 幂等兜底（StartAgent 内部按 agent 占位去重）。
+	go func() {
+		ctx := context.Background()
+		if ids := registry.List(); len(ids) > 0 {
+			preloadID := ids[0]
+			if err := mgr.StartAgent(ctx, preloadID); err != nil {
+				log.Warn("failed to preload agent", "agent", preloadID, "err", err)
+			} else {
+				log.Info("agent preloaded", "agent", preloadID)
+			}
 		}
-	}
+	}()
 	if cfg.Session.IdleTimeout > 0 {
 		log.Info("other agents start on demand", "idleTimeout", cfg.Session.IdleTimeout.String())
 	} else {
