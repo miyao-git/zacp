@@ -119,6 +119,7 @@ cd ~/prj/zacp && ./scripts/build.sh
    - 输入条（含 steer 叠层、错误/断线提示条）从流内布局改为**悬浮层**（`ChatPane.vue`：消息区 `relative flex-1` + 浮层 `absolute inset-x-0 bottom-0 z-30`，空白处 `pointer-events-none`），消息可滚到浮层下方，消除「消息区 / 输入框」之间的空白分区带；浮层高度由 `ResizeObserver` 实测写入 `--composer-h`
    - `--composer-h` 消费方：消息列底部留白 `pb-[calc(var(--composer-h,6rem)+1.5rem)]`（最后一条能滚到浮层上方）、「回到底部」按钮 `bottom-[calc(var(--composer-h)+0.75rem)]`、右侧消息导航条改为在「浮层以上」的高度带内垂直居中（`bottom-[calc(var(--composer-h)+0.5rem)]` + `max-h-full`）
    - 宽度对齐：消息区滚动条占布局宽度（实测 `clientWidth 1130` vs `offsetWidth 1140`），输入条不滚动 → 两者 `mx-auto` 居中时消息列整体偏半个滚动条宽。`MessageList` 把滚动条宽度写入 `--msg-scrollbar-w`，输入条外层 `.composer-shell` 按同宽度留白（必须加在 `max-w` 容器之外，否则会压窄卡片）；实测消息列与输入卡片 rect 完全一致（417..1313）
+   - 底部渐强模糊（`.message-bottom-fade`）：从输入卡片上方 40px 起向上渐隐、到卡片顶边处完全不透明并延续到页面底部，只遮对话记录（z-index 低于输入层/导航条、pointer-events-none）；消息列底部留白相应改为「浮层高度 + 64px」，保证静态最后一条消息停在溶解带之上不被淡化。**坑**：构建期 lightningcss 会把 `backdrop-filter` 去重成只剩 `-webkit-` 前缀，而 Chrome 不应用该前缀（computed 为 none），故此属性改为内联样式写在元素上；另注意严格按「卡片中部起」的遮罩会被不透明卡片完全挡住（不可见），故改为卡片上方起渐隐
    - 修复：流式期间新增工具卡/内容时列表未贴底，底部的思考面板会被顶到悬浮输入层下面（等思考文本增长才被拉回）。根因：跟随信号 `messageTick` 只含消息数/正文长度/思考长度，工具卡与流式块变化不在其中；已把「流式块数量」「工具卡数量」纳入信号
    - 已验证（隔离实例 + CDP 几何量测）：`alignLeft/alignRight = 0`、浮层高度 144px 与变量一致、最后一条消息与卡片间距 32px（=留白 24 + 卡片顶距 8）、导航条带 53..748（卡片顶 764 之上）、亮色截图确认无分区空白带
 

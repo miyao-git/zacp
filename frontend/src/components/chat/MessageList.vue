@@ -264,9 +264,10 @@ onBeforeUnmount(() => {
     <div ref="scroller" class="h-full overflow-y-auto" @scroll="handleScroll">
       <!-- 左右内边距与底部输入条一致（px-3 lg:px-0）：消息列与输入框卡片同宽，
            工具卡/正文的左右边缘与输入框描边对齐；safe-area 由外层容器承担。
-           底部额外留白 = 悬浮输入层高度（--composer-h，由 ChatPane 实测写入）：
-           输入条浮在消息之上，最后一条消息要能滚到它上方，不被永久遮住。 -->
-      <div class="content-container flex flex-col gap-4 px-3 pt-6 pb-[calc(var(--composer-h,6rem)_+_1.5rem)] lg:px-0">
+           底部额外留白 = 悬浮输入层高度 + 64px（--composer-h 由 ChatPane 实测写入）：
+           输入条浮在消息之上，且底部 40px 是渐强模糊的溶解带，最后一条消息要停在
+           溶解带之上，不被永久遮住。 -->
+      <div class="content-container flex flex-col gap-4 px-3 pt-6 pb-[calc(var(--composer-h,6rem)_+_4rem)] lg:px-0">
         <!-- ThemeProvider 把当前主题注入 incremark 渲染上下文：
              驱动 shiki 代码高亮在 github-light / github-dark 之间切换（CSS 层的
              data-theme 属性只影响代码块背景/容器色，token 颜色必须靠这个上下文）。

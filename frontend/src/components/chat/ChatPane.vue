@@ -200,6 +200,17 @@ function syncComposerHeight() {
   if (document.documentElement.style.getPropertyValue('--composer-h') !== next) {
     document.documentElement.style.setProperty('--composer-h', next)
   }
+  // 底部渐强模糊的高度：从输入卡片上方 40px 起（内容在此区间内渐隐溶解），
+  // 一直到页面底部（卡片下方完全不透明，不会在卡片下缘露出半截内容）
+  const card = el.querySelector<HTMLElement>('[data-composer-card]')
+  const FADE_RISE_PX = 40
+  const blurHeight = card
+    ? Math.round(el.getBoundingClientRect().bottom - card.getBoundingClientRect().top + FADE_RISE_PX)
+    : Math.round(el.offsetHeight * 0.55)
+  const blurNext = `${Math.max(blurHeight, 0)}px`
+  if (document.documentElement.style.getPropertyValue('--composer-blur-h') !== blurNext) {
+    document.documentElement.style.setProperty('--composer-blur-h', blurNext)
+  }
 }
 
 watch(composerOverlayRef, (el) => {
@@ -341,6 +352,20 @@ function onNewProjectFromHero() {
             class="absolute left-2 top-1/2 z-20 -translate-y-1/2"
           />
         </div>
+
+        <!-- 底部渐强模糊：从输入卡片上方 40px 起渐强，到卡片顶边处完全不透明（只在卡片
+             下方/两侧可见，不遮输入框），再往下覆盖到页面底部。z-index 低于悬浮输入层与
+             右侧导航条；pointer-events-none 不影响交互。
+             backdrop-filter 用内联样式：构建期 lightningcss 会把它去重成只剩 -webkit- 前缀，
+             而 Chrome 不应用该前缀属性（实测 computed 为 none），内联可绕过压缩器。 -->
+        <div
+          class="message-bottom-fade pointer-events-none absolute inset-x-0 bottom-0 z-[5]"
+          :style="{
+            height: 'var(--composer-blur-h, 5rem)',
+            backdropFilter: 'blur(6px)',
+            WebkitBackdropFilter: 'blur(6px)',
+          }"
+        />
 
         <!-- 浮层空白处 pointer-events-none：不挡下方消息的点击与选择；
              提示条与输入卡片各自开启 pointer-events-auto -->

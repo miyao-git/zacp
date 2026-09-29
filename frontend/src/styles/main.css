@@ -185,6 +185,26 @@ body {
 }
 
 /*
+ * 底部渐强模糊（对话记录 → 输入区的过渡）：
+ * - backdrop-filter（内联写在元素上，见 ChatPane.vue）做真实模糊，
+ *   mask-image 让模糊由底向上渐隐（渐强、无硬边）；
+ * - 再叠一层背景渐变：元素顶部 40px 为溶解带（对话记录在这里渐隐），
+ *   之后完全不透明 —— 卡片下缘不会露出半截内容，也不会与输入卡片互相干扰；
+ * - 高度由 ChatPane 实测写入 --composer-blur-h（卡片上方 40px 到页面底部）；
+ *   元素 pointer-events-none 且 z-index 低于输入层/导航条，只遮消息记录。
+ */
+.message-bottom-fade {
+  background: linear-gradient(
+    to bottom,
+    transparent 0,
+    var(--color-surface) 40px,
+    var(--color-surface) 100%
+  );
+  -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 40px, #000 100%);
+  mask-image: linear-gradient(to bottom, transparent 0, #000 40px, #000 100%);
+}
+
+/*
  * 底部输入条外壳：右侧预留「消息区滚动条宽度」，与消息列同宽对齐。
  * 消息区在滚动容器内，经典滚动条会占 10~17px 布局宽度，输入条不滚动；
  * 两者都 mx-auto 居中时消息列会整体偏半个滚动条宽（看起来没对齐）。

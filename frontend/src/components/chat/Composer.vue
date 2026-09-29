@@ -562,8 +562,10 @@ function onKeydown(e: KeyboardEvent) {
     </div>
 
     <!-- 输入卡片：有 steer 叠层时压住其下沿、并去掉上圆角（交界处成一条直线，
-         不出现「折回去」的缺口）；无叠层时保持完整圆角 -->
+         不出现「折回去」的缺口）；无叠层时保持完整圆角。
+         data-composer-card：ChatPane 据此测量「卡片中部」位置，作为底部渐强模糊的起点 -->
     <div
+      data-composer-card
       class="relative z-40 w-full border border-divider bg-surface-raised p-3 shadow-sm transition-shadow focus-within:border-divider focus-within:shadow-md"
       :class="steerStackItems.length ? 'rounded-b-2xl' : 'rounded-2xl'"
     >
