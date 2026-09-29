@@ -353,18 +353,13 @@ function onNewProjectFromHero() {
           />
         </div>
 
-        <!-- 底部渐强模糊：从输入卡片上方 40px 起渐强，到卡片顶边处完全不透明（只在卡片
-             下方/两侧可见，不遮输入框），再往下覆盖到页面底部。z-index 低于悬浮输入层与
-             右侧导航条；pointer-events-none 不影响交互。
-             backdrop-filter 用内联样式：构建期 lightningcss 会把它去重成只剩 -webkit- 前缀，
-             而 Chrome 不应用该前缀属性（实测 computed 为 none），内联可绕过压缩器。 -->
+        <!-- 底部渐强模糊：与底色同色的线性渐变（从上透明到下完全不透明，整段线性过渡），
+             从输入卡片上方 40px 起、一直覆盖到页面底部；只遮对话记录，不遮输入框
+             （z-index 低于悬浮输入层与右侧导航条；pointer-events-none 不影响交互）。
+             高度由实测的 --composer-blur-h 决定。 -->
         <div
           class="message-bottom-fade pointer-events-none absolute inset-x-0 bottom-0 z-[5]"
-          :style="{
-            height: 'var(--composer-blur-h, 5rem)',
-            backdropFilter: 'blur(6px)',
-            WebkitBackdropFilter: 'blur(6px)',
-          }"
+          :style="{ height: 'var(--composer-blur-h, 5rem)' }"
         />
 
         <!-- 浮层空白处 pointer-events-none：不挡下方消息的点击与选择；

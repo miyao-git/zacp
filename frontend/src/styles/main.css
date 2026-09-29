@@ -186,22 +186,27 @@ body {
 
 /*
  * 底部渐强模糊（对话记录 → 输入区的过渡）：
- * - backdrop-filter（内联写在元素上，见 ChatPane.vue）做真实模糊，
- *   mask-image 让模糊由底向上渐隐（渐强、无硬边）；
- * - 再叠一层背景渐变：元素顶部 40px 为溶解带（对话记录在这里渐隐），
- *   之后完全不透明 —— 卡片下缘不会露出半截内容，也不会与输入卡片互相干扰；
- * - 高度由 ChatPane 实测写入 --composer-blur-h（卡片上方 40px 到页面底部）；
- *   元素 pointer-events-none 且 z-index 低于输入层/导航条，只遮消息记录。
+ * 与底色同色的线性渐变 —— 顶部完全透明、底部约 50% 不透明（不是完全不透明：
+ * 卡片附近的内容仍微微透出），不透明度自下而上等量递减，整段都是过渡区。
+ * 颜色按主题写死（slate-50 / slate-900，与 --color-surface 一致）：
+ * 用 color-mix(var(--color-surface) 50%, transparent) 会被构建期解析成浅色字面量
+ * 并作为旧浏览器回退，暗色下会闪出浅色遮罩，故改为两套显式声明。
+ * 高度由 ChatPane 实测写入 --composer-blur-h（卡片上方 40px 到页面底部）。
+ * 元素 pointer-events-none 且 z-index 低于输入层/导航条，只遮消息记录。
  */
 .message-bottom-fade {
   background: linear-gradient(
     to bottom,
     transparent 0,
-    var(--color-surface) 40px,
-    var(--color-surface) 100%
+    rgba(248, 250, 252, 0.5) 100%
   );
-  -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 40px, #000 100%);
-  mask-image: linear-gradient(to bottom, transparent 0, #000 40px, #000 100%);
+}
+html.dark .message-bottom-fade {
+  background: linear-gradient(
+    to bottom,
+    transparent 0,
+    rgba(15, 23, 42, 0.5) 100%
+  );
 }
 
 /*
