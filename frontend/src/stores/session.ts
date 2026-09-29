@@ -9,7 +9,6 @@ import {
   removeWorkspace as apiRemoveWorkspace,
   reorderWorkspaces as apiReorderWorkspaces,
   fetchConfigOptions,
-  fetchContextUsage,
   fetchMessageUpdates,
   fetchMessages,
   fetchRecentSessions,
@@ -27,7 +26,6 @@ import type {
   ChatMessage,
   ChatSession,
   ConfigOption,
-  ContextUsage,
   Workspace,
 } from '@/types/models'
 import type {
@@ -377,17 +375,6 @@ export const useSessionStore = defineStore('session', () => {
    * agent 未通告时为空数组 → 前端不显示候选面板（不做本地兜底）。
    */
   const slashCommands = ref<AvailableCommand[]>([])
-
-  /**
-   * 当前会话的上下文用量（估算值，来自 GET context-usage）：
-   * 进入会话与每轮结束后刷新；agent 不提供真实用量，百分比为后端折算值，
-   * 无数据（未加载/请求失败）时为 null → 输入框旁不展示占用条。
-   */
-  const contextUsage = ref<ContextUsage | null>(null)
-  // 切换会话时清空：避免新会话数据返回前，输入框旁短暂展示上一个会话的占比
-  watch(currentId, () => {
-    contextUsage.value = null
-  })
 
   /** 当前会话对象；null 对应空态 */
   const activeSession = computed<ChatSession | null>(() => {
@@ -836,7 +823,6 @@ export const useSessionStore = defineStore('session', () => {
         loadMessages(sessionId),
         loadConfigOptions(sessionId),
         loadSlashCommands(sessionId),
-        loadContextUsage(sessionId),
       ])
     } catch (e) {
       if (ticket !== sessionResolveTicket) {
@@ -1538,28 +1524,6 @@ export const useSessionStore = defineStore('session', () => {
     }
   }
 
-  /**
-   * 加载当前会话的上下文用量估算（进入会话时与每轮结束后调用）。
-   * 只对「当前会话」生效：后台会话（多会话并发，A 结束时用户已切到 B）
-   * 不发请求也不写状态——切回 A 时 resolveSession 会重新拉取，
-   * 避免 A 的用量串进 B 的输入框视图。
-   * 失败置 null 隐藏占用条，不影响输入框其余功能。
-   */
-  async function loadContextUsage(sessionId: number) {
-    if (currentId.value !== sessionId) {
-      return
-    }
-    try {
-      const usage = await fetchContextUsage(sessionId)
-      if (currentId.value !== sessionId) {
-        return // 请求期间已切换会话：丢弃过期结果
-      }
-      contextUsage.value = usage
-    } catch {
-      contextUsage.value = null
-    }
-  }
-
   /** 设置会话配置项（select 型：切换模型/思考强度/mode），成功后更新本地 currentValue */
   async function setConfigOption(optionId: string, valueId: string) {
     const sessionId = currentId.value
@@ -1731,8 +1695,6 @@ export const useSessionStore = defineStore('session', () => {
       await loadMessageUpdates(sessionId, afterId, placeholderId, placeholderUserId)
       // agent 可能在 turn 中经 update 通知更新配置项，刷新以同步最新 currentValue
       await loadConfigOptions(sessionId)
-      // 本轮消息已落库：刷新上下文用量估算（后台会话由 loadContextUsage 内部跳过）
-      await loadContextUsage(sessionId)
       // / 命令首次进入会话时加载，后续依靠 WebSocket 广播更新，不在每轮重复 GET。
       if (initialSessionDetailRefresh.get(sessionId) === 'pending') {
         // 首条 prompt 后服务端可能生成摘要标题；成功同步后标记完成，后续轮次不再请求。
@@ -2110,6 +2072,20 @@ export const useSessionStore = defineStore('session', () => {
   }
 
   /**
+   * 解析 `/rename <title>` 命令：返回标题（trim 后非空、单行）；非该命令返回 null。
+   * 要求 `/rename` 后紧跟空白（避免 `/renamefoo` 误判），标题不含换行。
+   */
+  function parseRenameCommand(content: string): string | null {
+    const t = content.trim()
+    if (!t.startsWith('/rename')) return null
+    const rest = t.slice('/rename'.length)
+    if (rest !== '' && !/^\s/.test(rest)) return null
+    const title = rest.trim()
+    if (!title || title.includes('\n')) return null
+    return title
+  }
+
+  /**
    * 发送消息（WS prompt）：乐观追加用户消息 + 空 assistant 占位 →
    * socket 发送 prompt（sessionId 为 ACP session id）→ 事件流式追加 → turn.done 收尾。
    *
@@ -2125,6 +2101,17 @@ export const useSessionStore = defineStore('session', () => {
       sessionOverride ?? sessions.value.find((s) => s.id === sessionId)
     if (!session) {
       throw new Error('session not found')
+    }
+    // `/rename <title>`：改名命令不走对话流（不追加消息/占位/turn），改为直接重命名——
+    // 后端 RenameSession 会同步 zacp 标题并静默转发给 qoder（写 custom-title），两侧一致。
+    // 拦截条件：agent 通告了 rename 命令，或就是 qoder（其必定支持 /rename）——后者兜底
+    // slashCommands 尚未加载的时机，避免误当普通消息发出。
+    const renameTitle = parseRenameCommand(content)
+    const supportsRename =
+      session.agentId === 'qoder' || slashCommands.value.some((c) => c.name === 'rename')
+    if (renameTitle !== null && supportsRename) {
+      await renameSession(sessionId, renameTitle)
+      return
     }
     // 发送前守卫：该会话 turn 仍在执行/排队（含 resync 恢复的续流）时拒绝发送，
     // 避免在旧 turn 上串联新 prompt——后端会 ErrPromptInProgress，新消息变孤儿。
@@ -2330,7 +2317,6 @@ export const useSessionStore = defineStore('session', () => {
     pendingPermission,
     configOptions,
     slashCommands,
-    contextUsage,
     activeSession,
     activeMessages,
     defaultWorkspace,
@@ -2346,7 +2332,6 @@ export const useSessionStore = defineStore('session', () => {
     loadMessages,
     loadConfigOptions,
     loadSlashCommands,
-    loadContextUsage,
     setConfigOption,
     // 会话解析状态机（/sessions/:id 存在性校验），见 resolveSession
     sessionResolve,

@@ -30,6 +30,12 @@ export default {
     settings: '设置',
     rename: '重命名',
     delete: '删除',
+    viewSessionId: '查看 ID',
+    copySessionId: '复制 ID',
+    sessionIdTitle: '会话 ID',
+    copiedSessionId: '已复制会话 ID',
+    copyIdFailed: '复制失败，请手动复制',
+    sessionIdUnavailable: '该会话暂无 Agent 侧 ID（可能尚未发送消息）',
     renameTitle: '重命名会话',
     renamePlaceholder: '输入新标题',
     renameEmptyHint: '标题不能为空',
@@ -103,9 +109,6 @@ export default {
     reasoning: '思考过程',
     reasoningThinking: '思考中',
     reasoningLoading: '思考过程加载中…',
-    // 上下文占用（估算值；不含系统提示词等固定开销，见后端 service.GetContextUsage）
-    contextUsage: '上下文占用',
-    contextUsageTip: '估算：会话内容约 {used} tokens / 窗口 {window}（不含系统提示词等固定开销）',
     // steer 排队条（响应过程中发送的消息：本轮结束后自动发出，可编辑取回）
     steerEdit: '编辑这条排队消息',
     steerSendHint: '排队发送：本轮回复结束后自动发出',

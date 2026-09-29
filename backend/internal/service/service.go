@@ -158,9 +158,6 @@ type SessionService struct {
 	mgr           *manager.Manager
 	// defaultCwd 是 config session.default_cwd；创建会话未指定工作区时的回退路径。
 	defaultCwd string
-	// contextWindowOf 返回 agent 的上下文窗口（token 数），由组装层注入
-	// config.ContextWindowOf；供 GetContextUsage 估算占用百分比时取分母。
-	contextWindowOf func(agentID string) int
 
 	// OnSessionRebuilt 可选回调：ACP 会话重建（id 变化）后触发，由组装层注入
 	//（如 ws.Handler.RebindSession），使 REST 路径重建后也能迁移 WS 订阅，
@@ -169,14 +166,13 @@ type SessionService struct {
 }
 
 // NewSessionService 创建会话服务
-func NewSessionService(workspaceRepo *store.WorkspaceRepository, sessionRepo *store.SessionRepository, msgRepo *store.MessageRepository, mgr *manager.Manager, defaultCwd string, contextWindowOf func(agentID string) int) *SessionService {
+func NewSessionService(workspaceRepo *store.WorkspaceRepository, sessionRepo *store.SessionRepository, msgRepo *store.MessageRepository, mgr *manager.Manager, defaultCwd string) *SessionService {
 	return &SessionService{
-		workspaceRepo:   workspaceRepo,
-		sessionRepo:     sessionRepo,
-		msgRepo:         msgRepo,
-		mgr:             mgr,
-		defaultCwd:      defaultCwd,
-		contextWindowOf: contextWindowOf,
+		workspaceRepo: workspaceRepo,
+		sessionRepo:   sessionRepo,
+		msgRepo:       msgRepo,
+		mgr:           mgr,
+		defaultCwd:    defaultCwd,
 	}
 }
 
@@ -289,7 +285,7 @@ func (s *SessionService) CreateSession(ctx context.Context, workspaceID uint, ag
 		WorkspaceID:   workspace.ID,
 		AgentID:       agentID,
 		ACPSessionID:  acpSessionID,
-		Title:         "新会话",
+		Title:         model.DefaultSessionTitle,
 		Status:        model.SessionStatusActive,
 		IsDraft:       isDraft,
 		ConfigOptions: configJSON,
@@ -316,12 +312,18 @@ func (s *SessionService) GetSession(id uint) (*model.Session, error) {
 	if err != nil {
 		return nil, fmt.Errorf("session not found: %w", err)
 	}
+	// qoder：进入会话时用 qodercli 侧标题（custom-title > ai-title）统一 WebUI 标题。
+	// best-effort，仅当标题仍是自动派生值时覆盖（保护手动改名）；见 qoder_session_files.go。
+	s.maybeSyncQoderTitle(session)
 	return session, nil
 }
 
-// RenameSession 重命名会话标题（用户手动重命名，仅更新本地 DB 的 title 字段）。
+// RenameSession 重命名会话标题（用户手动重命名 / 输入框 /rename 命令，仅更新本地 DB 的 title）。
 // 不触发 ACP session_info_update；若 agent 后续再推送 AI 总结标题，
 // 前端会依据「用户已手动改名」标记跳过覆盖（见 stores/session.ts）。
+//
+// qoder：改名成功后往其会话 jsonl 追加一条 custom-title 行（等价 qodercli 里的 /rename），
+// 使 `qodercli --list-sessions` 与 WebUI 标题一致（见 writeQoderCustomTitle）。
 func (s *SessionService) RenameSession(id uint, title string) error {
 	title = strings.TrimSpace(title)
 	if title == "" {
@@ -330,10 +332,24 @@ func (s *SessionService) RenameSession(id uint, title string) error {
 	if len([]rune(title)) > 200 {
 		return fmt.Errorf("%w: title too long (max 200 chars)", ErrInvalidArgument)
 	}
-	if _, err := s.sessionRepo.GetByID(id); err != nil {
+	session, err := s.sessionRepo.GetByID(id)
+	if err != nil {
 		return fmt.Errorf("%w: %v", ErrSessionNotFound, err)
 	}
-	return s.sessionRepo.UpdateTitle(id, title)
+	if err := s.sessionRepo.UpdateTitle(id, title); err != nil {
+		return err
+	}
+	// qoder：把改名同步到 agent 侧——往其会话 jsonl 追加 custom-title 行（等价 qodercli
+	// 里的 /rename），使 `qodercli --list-sessions` 与 WebUI 标题一致。best-effort：
+	// 文件写入失败只记日志，不影响 zacp 侧已完成的改名。网页改名弹窗与输入框 /rename
+	// 命令都经此路径统一传播。见 qoder_session_files.go。
+	if session.AgentID == qoderAgentID && session.ACPSessionID != "" {
+		if err := writeQoderCustomTitle(session.ACPSessionID, title); err != nil {
+			slog.Warn("rename: write qoder custom-title failed",
+				"session", session.ACPSessionID, "err", err)
+		}
+	}
+	return nil
 }
 
 // ListSessions 列出工作目录下的所有会话（按项目分页，默认 20，上限 100；offset 分页，前端最多 60）
@@ -410,9 +426,17 @@ func (s *SessionService) deleteOrCloseAgentSession(ctx context.Context, agentID,
 	return false
 }
 
-// cleanupAgentSession 异步清理 agent 侧会话数据（总预算 agentSessionCleanupTimeout）：
-//  0. 按需拉起 agent：协议层清理需要在线进程，agent 被空闲回收/服务重启后
-//     此前会静默失败（会话持久化数据残留在 agent 磁盘上）；
+// cleanupAgentSession 异步清理 agent 侧会话数据（总预算 agentSessionCleanupTimeout）。
+//
+// qoder（本地 fork）：不额外拉起进程；进程恰好在跑时 best-effort 发一次协议删除
+// （清理其内存态），随后**始终**按 UUID 直接删磁盘文件——因为 qodercli 的 ACP
+// session/delete 只按「进程当前项目(cwd)」定位会话，对非当前项目的会话返回
+// "Invalid session identifier"，被 IsUnknownSessionErr 当成「已删除」→ 协议层假成功，
+// 磁盘上 <uuid>.jsonl 与 <uuid>/ 目录仍残留（用户看到的「只删了 SQLite 记录」）。
+// 详见 qoder_session_files.go。
+//
+// 其它 agent：
+//  0. 按需拉起 agent：协议层清理需要在线进程；
 //  1. 协议层清理（delete → close 降级，见 deleteOrCloseAgentSession）；
 //  2. 仍失败 → 兜底：仅当该 agent 在 DB 中已无任何会话时才停止其进程（此时 kill
 //     无副作用）；还有其它会话则保留进程、记 WARN——宁可残留单个会话数据，
@@ -422,6 +446,20 @@ func (s *SessionService) cleanupAgentSession(session *model.Session) {
 	defer cancel()
 
 	agentID, acpID := session.AgentID, session.ACPSessionID
+
+	if agentID == qoderAgentID {
+		// 进程在跑则顺带清内存态；不在跑时 deleteOrClose 直接失败返回，不触发拉起。
+		_ = s.deleteOrCloseAgentSession(ctx, agentID, acpID)
+		if n, err := removeQoderSessionFiles(acpID); err != nil {
+			slog.Warn("cleanup agent session: remove qoder files failed",
+				"agent", agentID, "session", acpID, "err", err)
+		} else if n > 0 {
+			slog.Info("cleanup agent session: removed qoder session files",
+				"session", acpID, "removed", n)
+		}
+		return
+	}
+
 	if err := s.mgr.EnsureStarted(ctx, agentID); err != nil {
 		// 启动失败仅告警：此时通常也确无进程可回收，继续走兜底判定
 		slog.Warn("cleanup agent session: ensure agent started failed",

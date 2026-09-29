@@ -2,13 +2,12 @@
 import { computed, h, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import type { VNodeChild } from 'vue'
 import { useI18n } from 'vue-i18n'
-import { AddOutline, CreateOutline, OptionsOutline, SendOutline, StopOutline } from '@vicons/ionicons5'
+import { AddOutline, CreateOutline, OptionsOutline, StopOutline } from '@vicons/ionicons5'
 import { NIcon, useMessage } from 'naive-ui'
 import type { InputInst, SelectGroupOption, SelectOption } from 'naive-ui'
 import { useSessionStore, MAX_TURNS_PER_SESSION, type SessionStreamStatus } from '@/stores/session'
 import { uploadTempFiles } from '@/api'
 import { extractPastedFiles, prepareFile } from '@/utils/fileUpload'
-import ContextUsageBadge from '@/components/chat/ContextUsageBadge.vue'
 import type { ConfigOptionValue } from '@/types/models'
 
 /** Composer 提交载荷（card / bar 共用） */
@@ -674,12 +673,6 @@ function onKeydown(e: KeyboardEvent) {
           />
         </template>
         <span v-else class="text-xs text-ink-muted">{{ t('chat.enterHint') }}</span>
-        <!-- 上下文占用（估算）：放在配置项（模型/思考强度…）之后，样式对齐参考图 -->
-        <ContextUsageBadge
-          v-if="sessionStore.contextUsage"
-          class="shrink-0"
-          :usage="sessionStore.contextUsage"
-        />
       </div>
 
       <!-- 移动端工具组（[+] 图片上传 + 调校配置）：同一容器内部 gap 紧挨，整组固定居左。
@@ -726,37 +719,17 @@ function onKeydown(e: KeyboardEvent) {
           <n-spin :size="13" />
           {{ t('chat.stopping') }}
         </span>
-        <!-- 处理中（排队/流式/停止确认）：红色停止按钮外层套「彗星」光弧——
-             一条头部亮、尾部渐隐的弧，缓慢绕按钮旋转扫过（3s 一圈），
-             比满圈虚线更优雅、更低调；pointer-events-none 不挡按钮点击。
-             动画仅 bar（会话输入条）模式显示；card（/new 新建会话）只要改小按钮、
-             不要动画效果（见 v-if="mode === 'bar'"） -->
-        <span v-if="status !== 'idle'" class="relative inline-flex">
-          <span v-if="mode === 'bar'" class="comet-ring"></span>
-          <n-button
-            type="error"
-            size="small"
-            circle
-            :disabled="status === 'cancelling'"
-            @click="emit('cancel')"
-          >
-            <template #icon>
-              <n-icon :size="16"><StopOutline /></n-icon>
-            </template>
-          </n-button>
-        </span>
+        <!-- 处理中（排队/流式/停止确认）：红色停止按钮 -->
         <n-button
-          v-if="status === 'idle' || canSend"
-          type="primary"
+          v-if="status !== 'idle'"
+          type="error"
           size="small"
           circle
-          :loading="fileUploading"
-          :disabled="!canSend"
-          :title="status === 'idle' ? undefined : t('chat.steerSendHint')"
-          @click="onSend"
+          :disabled="status === 'cancelling'"
+          @click="emit('cancel')"
         >
           <template #icon>
-            <n-icon :size="16"><SendOutline /></n-icon>
+            <n-icon :size="16"><StopOutline /></n-icon>
           </template>
         </n-button>
       </div>
@@ -822,16 +795,6 @@ function onKeydown(e: KeyboardEvent) {
         <p v-else class="py-4 text-center text-xs text-ink-muted">
           {{ t('chat.enterHint') }}
         </p>
-        <!-- 上下文占用（估算）：手机上配置行整体隐藏，这里补一份只读展示 -->
-        <div
-          v-if="sessionStore.contextUsage"
-          class="mt-2.5 flex items-center justify-between gap-3 rounded-xl border border-divider bg-surface px-3.5 py-3"
-        >
-          <span class="min-w-0 flex-1 truncate text-sm font-medium text-ink">
-            {{ t('chat.contextUsage') }}
-          </span>
-          <ContextUsageBadge :usage="sessionStore.contextUsage" />
-        </div>
       </div>
       </n-config-provider>
     </n-drawer-content>
@@ -853,53 +816,5 @@ function onKeydown(e: KeyboardEvent) {
 .opt-select :deep(.n-base-selection__border),
 .opt-select :deep(.n-base-selection__state-border) {
   display: none;
-}
-/* 处理中红色按钮的「彗星」光弧：
- * - conic-gradient 只点亮约 110° 的弧段，且由尾部（约 250° 起，几乎透明）
- *   到头部（360°，最亮）渐强，形成「彗尾拖长渐隐、头部聚集」的扫掠感；
- * - mask 径向镂空中心，只留约 1px 宽的细圆环（1px 的过渡沿让边缘柔和）；
- * - 3s 一圈匀速旋转，缓慢优雅；.dark 下换浅红系保持暗色可见。
- */
-.comet-ring {
-  position: absolute;
-  inset: -6px;
-  border-radius: 9999px;
-  pointer-events: none;
-  background: conic-gradient(
-    from 0deg,
-    transparent 0deg,
-    transparent 250deg,
-    rgba(239, 68, 68, 0.08) 280deg,
-    rgba(239, 68, 68, 0.4) 320deg,
-    rgba(239, 68, 68, 0.85) 350deg,
-    rgba(239, 68, 68, 1) 360deg
-  );
-  -webkit-mask: radial-gradient(
-    farthest-side,
-    transparent calc(100% - 3px),
-    #000 calc(100% - 2px)
-  );
-  mask: radial-gradient(
-    farthest-side,
-    transparent calc(100% - 3px),
-    #000 calc(100% - 2px)
-  );
-  animation: comet-spin 3s linear infinite;
-}
-.dark .comet-ring {
-  background: conic-gradient(
-    from 0deg,
-    transparent 0deg,
-    transparent 250deg,
-    rgba(248, 113, 113, 0.08) 280deg,
-    rgba(248, 113, 113, 0.4) 320deg,
-    rgba(248, 113, 113, 0.85) 350deg,
-    rgba(248, 113, 113, 1) 360deg
-  );
-}
-@keyframes comet-spin {
-  to {
-    transform: rotate(360deg);
-  }
 }
 </style>

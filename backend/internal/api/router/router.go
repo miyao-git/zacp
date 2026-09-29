@@ -154,8 +154,6 @@ func New(
 			authed.GET("/sessions/:id/config-options", sessionHandler.GetConfigOptions)
 			authed.POST("/sessions/:id/config-options", sessionHandler.SetConfigOption)
 			authed.GET("/sessions/:id/slash-commands", sessionHandler.GetSlashCommands)
-			// 上下文用量估算（输入框旁展示占用百分比；ACP 无真实用量，按消息内容折算）
-			authed.GET("/sessions/:id/context-usage", sessionHandler.GetContextUsage)
 
 			// Chat（兼容旧 demo）
 			authed.POST("/chat", chatHandler.Chat)

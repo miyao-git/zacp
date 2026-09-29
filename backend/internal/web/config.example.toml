@@ -38,11 +38,6 @@ path = "data/zacp.db"
 
 # 多 Agent 配置：每个二进制/ACP 入口一条
 # 前端可查看所有 enabled 的 agent 并切换
-#
-# context_window（可选）：该 agent 所用模型的上下文窗口（token 数），
-# 仅用于前端输入框旁展示「上下文占用百分比」的分母；ACP 不提供窗口大小
-#（agent 也未必上报 usage_update），需按所用模型填写；省略时回退 200000。
-# 占用值是按会话消息内容折算的估算值，不是 agent 上报的真实 token 数。
 
 # [[agents]]
 # id = "reasonix"
@@ -54,7 +49,6 @@ path = "data/zacp.db"
 # args = ["--acp"]
 # 空则用 session.default_cwd
 # cwd = ""
-# context_window = 200000
 
 # 示例：Pi Agent（默认禁用）
 # [[agents]]

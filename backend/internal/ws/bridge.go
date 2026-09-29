@@ -711,15 +711,6 @@ func (b *EventBridge) ResolvePermission(permissionID, optionID string) {
 	b.handler.BroadcastPermissionResolved(pending.sessionID, permissionID)
 }
 
-// deriveTitle 从首条用户消息生成会话标题（最多 24 个字符）
-func deriveTitle(message string) string {
-	r := []rune(strings.TrimSpace(message))
-	if len(r) <= 24 {
-		return string(r)
-	}
-	return string(r[:24]) + "…"
-}
-
 // HandlePrompt 处理 WebSocket 的 prompt 消息（每帧一个 goroutine，可并发进入）。
 // 并发语义：全局最多 3 个 prompt 进入 ACP，更多请求按 FIFO 排队；
 // 不同 session 的事件、回复和权限按 ACP session id 隔离。
@@ -784,8 +775,8 @@ func (b *EventBridge) handlePrompt(ctx context.Context, sessionID, agentID, mess
 	}
 
 	// 首条消息生成会话标题（仅当仍是默认标题时）
-	if dbSession.Title == "" || dbSession.Title == "新会话" {
-		_ = b.sessionRepo.UpdateTitle(dbSession.ID, deriveTitle(message))
+	if dbSession.Title == "" || dbSession.Title == model.DefaultSessionTitle {
+		_ = b.sessionRepo.UpdateTitle(dbSession.ID, model.DeriveTitle(message))
 	}
 
 	// 该会话已有 turn 在执行/排队（「响应过程中继续发消息」）：用户消息已落库

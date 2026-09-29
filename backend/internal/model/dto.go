@@ -25,15 +25,6 @@ type AvailableCommandDTO struct {
 	InputHint   string `json:"inputHint,omitempty"`   // 参数提示（如 "<task>"），选中后展示
 }
 
-// ContextUsageDTO 会话上下文用量（估算值，供前端输入框旁展示占用百分比）。
-// ACP 协议与 agent 均不保证提供真实用量（qodercli 实测不上报 usage_update），
-// 这里按会话全部消息内容折算 token 估算，见 service.EstimateContextUsage。
-type ContextUsageDTO struct {
-	UsedTokens   int `json:"usedTokens"`   // 估算的上下文占用 token 数
-	WindowTokens int `json:"windowTokens"` // 窗口大小（agents[].context_window）
-	Percent      int `json:"percent"`      // 占用百分比（0-100，封顶）
-}
-
 // SessionSearchSnippetDTO 会话搜索的正文命中片段（仅正文命中的条目录入，标题命中不重复展示）。
 type SessionSearchSnippetDTO struct {
 	MessageID uint   `json:"messageId"` // 所在消息 id（预留：后续可支持「跳到该消息」）

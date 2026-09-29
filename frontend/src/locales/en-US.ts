@@ -31,6 +31,12 @@ export default {
     settings: 'Settings',
     rename: 'Rename',
     delete: 'Delete',
+    viewSessionId: 'View ID',
+    copySessionId: 'Copy ID',
+    sessionIdTitle: 'Session ID',
+    copiedSessionId: 'Session ID copied',
+    copyIdFailed: 'Copy failed — please copy manually',
+    sessionIdUnavailable: 'No agent-side ID yet (send a message first)',
     renameTitle: 'Rename session',
     renamePlaceholder: 'Enter a new title',
     renameEmptyHint: 'Title cannot be empty',
@@ -104,9 +110,6 @@ export default {
     reasoning: 'Thought process',
     reasoningThinking: 'Thinking',
     reasoningLoading: 'Loading thoughts…',
-    // Context usage (estimated; excludes system prompt overhead — see service.GetContextUsage)
-    contextUsage: 'Context usage',
-    contextUsageTip: 'Estimate: ~{used} tokens of {window} window (excludes system prompt overhead)',
     // Steer queue (messages sent while a turn is running: auto-sent after the turn, editable)
     steerEdit: 'Edit this queued message',
     steerSendHint: 'Queue: sent right after the current turn',

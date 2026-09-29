@@ -1,16 +1,16 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, reactive, ref, watch } from 'vue'
+import { computed, h, onBeforeUnmount, reactive, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useRoute, useRouter } from 'vue-router'
 import {
   AddOutline,
   ChevronDownOutline,
+  EllipsisHorizontalOutline,
   FolderOpenOutline,
   FolderOutline,
-  ReorderThreeOutline,
   TrashOutline,
 } from '@vicons/ionicons5'
-import { NIcon, useMessage } from 'naive-ui'
+import { NIcon, useMessage, type DropdownOption } from 'naive-ui'
 import { useSessionStore } from '@/stores/session'
 import { useAppStore } from '@/stores/app'
 import type { ChatSession, Workspace } from '@/types/models'
@@ -74,47 +74,50 @@ const hasAny = computed(
 )
 
 /**
- * 每项目可见会话条数：默认 20，点「查看更多」+20，最多 60（20*3）后按钮消失。
- * 配合 store 分页（首包 20，按需增量 20，上限 60），超过本地已拉取时触发后端分页。
+ * 每项目可见会话条数：展开时默认 10 条，点「查看更多」每次 +10，最多 60。
+ * 折叠项目时清空该项目的可见计数（见 toggleWorkspace），再次展开回到默认 10，
+ * 不记忆上次动态加载到的条数。配合 store 分页（首包 20，按需增量，上限 60），
+ * 超过本地已拉取时触发后端分页。
  */
-const PAGE_SIZE = 20
-const MAX_VISIBLE = PAGE_SIZE * 3
+const INITIAL_VISIBLE = 10
+const LOAD_STEP = 10
+const MAX_VISIBLE = 60
 const visibleCount = reactive<Record<number, number>>({})
 
 /** 当前项目实际渲染的会话（后端已按 updatedAt 倒序，取前 N 条即最近使用） */
 function visibleSessions(group: { workspace: Workspace; sessions: ChatSession[] }) {
-  const n = visibleCount[group.workspace.id] ?? PAGE_SIZE
+  const n = visibleCount[group.workspace.id] ?? INITIAL_VISIBLE
   return group.sessions.slice(0, n)
 }
 
 /** 是否显示「查看更多」：本地有更多未展示或后端还有更多（分页）且未到 60 上限 */
 function canLoadMore(group: { workspace: Workspace; sessions: ChatSession[] }) {
-  const n = visibleCount[group.workspace.id] ?? PAGE_SIZE
+  const n = visibleCount[group.workspace.id] ?? INITIAL_VISIBLE
   if (n >= MAX_VISIBLE) return false
   if (group.sessions.length > n) return true
   return !!sessionStore.workspaceSessionsHasMore[group.workspace.id]
 }
 
-/** 点击「查看更多」：本地有缓存则直接展开，否则触发后端分页（20 条/次） */
+/** 点击「查看更多」：本地有缓存则直接展开，否则触发后端分页 */
 async function loadMore(wsId: number) {
-  const n = visibleCount[wsId] ?? PAGE_SIZE
+  const n = visibleCount[wsId] ?? INITIAL_VISIBLE
   const group = groups.value.find((g) => g.workspace.id === wsId)
   // 本地已有更多未展示，直接展开
   if (group && group.sessions.length > n) {
-    visibleCount[wsId] = Math.min(n + PAGE_SIZE, MAX_VISIBLE)
+    visibleCount[wsId] = Math.min(n + LOAD_STEP, MAX_VISIBLE)
     return
   }
   // 需后端分页
   if (sessionStore.workspaceSessionsHasMore[wsId]) {
     try {
       await sessionStore.loadMoreSessionsByWorkspace(wsId)
-      visibleCount[wsId] = Math.min(n + PAGE_SIZE, MAX_VISIBLE)
+      visibleCount[wsId] = Math.min(n + LOAD_STEP, MAX_VISIBLE)
     } catch (e) {
       message.error(e instanceof Error ? e.message : String(e))
     }
     return
   }
-  visibleCount[wsId] = Math.min(n + PAGE_SIZE, MAX_VISIBLE)
+  visibleCount[wsId] = Math.min(n + LOAD_STEP, MAX_VISIBLE)
 }
 
 /**
@@ -187,7 +190,7 @@ function revealCurrentSession() {
   // 可见条数：当前会话被截断时提升到包含它（取 max，不回调用户已展开的量）
   const group = groups.value.find((g) => g.workspace.id === ws.id)
   const idx = group?.sessions.findIndex((x) => x.id === id) ?? -1
-  if (idx >= 0 && idx >= (visibleCount[ws.id] ?? PAGE_SIZE)) {
+  if (idx >= 0 && idx >= (visibleCount[ws.id] ?? INITIAL_VISIBLE)) {
     visibleCount[ws.id] = idx + 1
   }
 }
@@ -205,9 +208,10 @@ watch(
 // 项目手动拖拽排序（顺序持久化到后端 workspaces.sort_order，见 store.reorderWorkspaces）
 //
 // 实现要点（手写 pointer events，不引拖拽库）：
-// - 只能从项目头的拖拽手柄发起：与「点击整行展开/折叠」、页面滚动天然隔离
-//   （手柄 touch-action:none，触屏按下即进入拖拽而非滚动）；
-// - 位移超过阈值才算拖拽（未超过的按下视为普通点击，不提交）；
+// - 从整个项目头（文件夹图标 + 名称区域）按下发起：不再单列拖拽手柄按钮。
+//   仅鼠标主键触发拖拽；触屏保留原生纵向滚动（拖拽排序作为桌面能力），
+//   项目头上的操作按钮（新建会话 / 更多菜单）用 @pointerdown.stop 隔离，不会误触发；
+// - 位移超过阈值才算拖拽（未超过的按下视为普通点击 → 展开/折叠，不提交排序）；
 // - 拖拽中不改动数据/DOM 顺序：只渲染落点指示线；pointerup 时一次性提交
 //   （乐观更新 + 后端持久化，失败回滚并提示）；
 // - 落点按「项目头中点」判定：展开的项目组很高，用整组中点会误判；
@@ -237,14 +241,20 @@ let dragIdsSnapshot: number[] = []
 /** 指针最近一次视口 Y（自动滚动判定用） */
 let dragPointerY = 0
 let autoScrollRaf = 0
+/**
+ * 刚结束一次真实拖拽的标记：拖拽抬手后浏览器仍会补发一次 click，
+ * 用它抑制该 click 触发的展开/折叠（拖拽不应改变展开态）。
+ * 每次项目头 pointerdown 复位，避免残留吞掉后续正常点击。
+ */
+let justDragged = false
 
-/** 手柄按下：登记待定拖拽（位移越过阈值后进入拖拽态） */
-function onHandlePointerDown(event: PointerEvent, index: number) {
-  if (event.pointerType === 'mouse' && event.button !== 0) return // 仅鼠标主键
-  event.preventDefault() // 阻止文本选择/原生拖拽；点击语义由手柄 @click.stop 兜底
+/** 项目头按下：登记待定拖拽（位移越过阈值后进入拖拽态）；仅鼠标主键 */
+function onHeaderPointerDown(event: PointerEvent, index: number) {
+  if (event.pointerType !== 'mouse' || event.button !== 0) return // 触屏交给原生滚动
+  justDragged = false
   event.stopPropagation()
   try {
-    // 指针捕获：指针移出手柄后事件仍回投给它，拖拽不中断
+    // 指针捕获：指针移出项目头后事件仍回投给它，拖拽不中断
     ;(event.currentTarget as HTMLElement | null)?.setPointerCapture(event.pointerId)
   } catch {
     // 指针已失效（极少见）：忽略，window 级监听仍能收到后续事件
@@ -338,6 +348,8 @@ function finishDrag(commit: boolean) {
   const ids = dragIdsSnapshot
   const started = draggingId.value !== null
   stopDrag()
+  // 真实拖拽过：抑制抬手后补发的 click，避免误切换展开态
+  if (started) justDragged = true
   if (!commit || !started || from < 0 || to < 0 || ids.length === 0) return
   // to 是「插到第 to 个之前」：移除自身后，位于其后的落点需左移一位
   const insertAt = to > from ? to - 1 : to
@@ -374,11 +386,22 @@ function toggleWorkspace(id: number) {
   const next = new Set(expandedIds.value)
   if (next.has(id)) {
     next.delete(id)
+    // 折叠即忘记本项目「查看更多」加载到的条数：再次展开回到默认 10 条
+    delete visibleCount[id]
   } else {
     next.add(id)
     void sessionStore.loadSessionsByWorkspace(id)
   }
   expandedIds.value = next
+}
+
+/** 项目头点击：拖拽抬手后补发的 click 不切换展开态（见 justDragged） */
+function onHeaderClick(id: number) {
+  if (justDragged) {
+    justDragged = false
+    return
+  }
+  toggleWorkspace(id)
 }
 
 /** 在该项目下新建会话：进入 /new?workspaceId=X 空态 */
@@ -394,6 +417,40 @@ function retryLoadInitial() {
   void sessionStore.loadInitial()
 }
 
+// ---------- 项目「更多」菜单（三点按钮，样式对齐会话条目）----------
+
+/** 项目菜单项：左侧图标 + 右侧文字（当前仅「移除」一项） */
+const projectMenuOptions: DropdownOption[] = [
+  {
+    key: 'delete',
+    label: () => t('shell.removeProject'),
+    icon: () => h(NIcon, null, { default: () => h(TrashOutline) }),
+  },
+]
+
+/** 当前展开菜单的项目 id：菜单打开期间保持三点按钮可见（避免移开鼠标后消失） */
+const openMenuWsId = ref<number | null>(null)
+/** 待确认移除的项目（点击菜单「移除」后弹确认框，确认再执行软删除） */
+const pendingRemoveWs = ref<Workspace | null>(null)
+const removeConfirmVisible = ref(false)
+
+/** 项目菜单选择分发：目前仅「移除」→ 打开确认框 */
+function onProjectMenuSelect(key: string | number, ws: Workspace) {
+  if (key === 'delete') {
+    pendingRemoveWs.value = ws
+    removeConfirmVisible.value = true
+  }
+}
+
+/** 项目菜单开合：记录当前展开菜单的项目，使其三点按钮在菜单打开期间保持可见 */
+function onProjectMenuToggle(show: boolean, wsId: number) {
+  if (show) {
+    openMenuWsId.value = wsId
+  } else if (openMenuWsId.value === wsId) {
+    openMenuWsId.value = null
+  }
+}
+
 /** 移除项目（软删除）：项目从侧栏隐藏，同路径再次添加时整体恢复（含会话/消息） */
 async function onRemoveWorkspace(ws: Workspace) {
   try {
@@ -401,6 +458,13 @@ async function onRemoveWorkspace(ws: Workspace) {
   } catch (e) {
     message.error(e instanceof Error ? e.message : String(e))
   }
+}
+
+/** 确认框「确定」：移除待定项目 */
+async function onConfirmRemoveWorkspace() {
+  const ws = pendingRemoveWs.value
+  pendingRemoveWs.value = null
+  if (ws) await onRemoveWorkspace(ws)
 }
 </script>
 
@@ -435,13 +499,15 @@ async function onRemoveWorkspace(ws: Workspace) {
           class="pointer-events-none absolute -bottom-2 left-1 right-1 h-0.5 rounded-full bg-primary"
           aria-hidden="true"
         />
-        <!-- 项目头：整行可点击，切换该项目会话列表的展开/折叠 -->
+        <!-- 项目头：整行点击切换展开/折叠；鼠标按住整块可拖拽排序（见 onHeaderPointerDown）。
+             select-none 避免拖拽时选中项目名文本 -->
         <div
           data-ws-header
-          class="group/header flex cursor-pointer items-center justify-between rounded px-1 py-1.5 transition-colors hover:bg-surface-hover"
+          class="group/header flex cursor-pointer select-none items-center justify-between rounded px-1 py-1.5 transition-colors hover:bg-surface-hover"
           role="button"
           tabindex="0"
-          @click="toggleWorkspace(group.workspace.id)"
+          @pointerdown="onHeaderPointerDown($event, index)"
+          @click="onHeaderClick(group.workspace.id)"
           @keydown.enter.self="toggleWorkspace(group.workspace.id)"
         >
           <!-- 文件夹图标（展开时切换为打开状态，兼作展开指示）+ 项目名（淡色，hover 加深） -->
@@ -459,15 +525,41 @@ async function onRemoveWorkspace(ws: Workspace) {
               {{ projectName(group.workspace) }}
             </span>
           </span>
-          <!-- hover 显示的操作区：拖拽手柄（最左）+ 移除 + 新建会话（右）；n-button text 纯图标按钮，不占宽度；
-               @click.stop 防止点击操作按钮误触项目头的展开/折叠。
-               pointer-coarse 变体：触屏设备无 hover，操作区常显，保证手机端功能可达 -->
+          <!-- 操作区：更多菜单（hover 显示的三点按钮，左）+ 新建会话（常驻显示，最右）；
+               @click.stop / @pointerdown.stop 防止点击按钮误触项目头的展开/折叠与拖拽。
+               pointer-coarse 变体：触屏设备无 hover，三点按钮常显，保证手机端功能可达 -->
           <div
-            class="flex shrink-0 items-center gap-1 opacity-0 transition-opacity focus-within:opacity-100 group-hover/header:opacity-100 pointer-coarse:opacity-100"
+            class="flex shrink-0 items-center gap-0.5"
             @click.stop
+            @pointerdown.stop
           >
-            <!-- 拖拽手柄：仅此入口可发起排序拖拽（与整行点击展开/触屏滚动隔离，见 onHandlePointerDown）；
-                 touch-none = touch-action:none（触屏按下即拖拽而不是滚动页面） -->
+            <!-- 更多菜单（三点）：hover 显示，菜单打开期间保持可见；点击弹出「移除」项（图标+文字） -->
+            <n-dropdown
+              trigger="click"
+              :options="projectMenuOptions"
+              placement="bottom-end"
+              @select="(key) => onProjectMenuSelect(key, group.workspace)"
+              @update:show="(v) => onProjectMenuToggle(v, group.workspace.id)"
+            >
+              <n-button
+                text
+                size="small"
+                class="text-ink-muted transition-opacity hover:text-ink-secondary"
+                :class="
+                  openMenuWsId === group.workspace.id
+                    ? 'opacity-100'
+                    : 'opacity-0 group-hover/header:opacity-100 pointer-coarse:opacity-100'
+                "
+                aria-label="project actions"
+                @click.stop
+              >
+                <template #icon>
+                  <n-icon :size="18"><EllipsisHorizontalOutline /></n-icon>
+                </template>
+              </n-button>
+            </n-dropdown>
+
+            <!-- 新建会话：常驻最右，浅灰小图标 + tooltip；进入该项目的 /new 空态 -->
             <n-tooltip
               trigger="hover"
               placement="top"
@@ -476,67 +568,13 @@ async function onRemoveWorkspace(ws: Workspace) {
               <template #trigger>
                 <n-button
                   text
-                  size="small"
-                  class="cursor-grab touch-none text-ink-muted hover:text-ink-secondary active:cursor-grabbing"
-                  :aria-label="t('shell.dragProject')"
-                  @pointerdown.prevent.stop="onHandlePointerDown($event, index)"
-                  @click.stop
-                >
-                  <template #icon>
-                    <n-icon :size="18"><ReorderThreeOutline /></n-icon>
-                  </template>
-                </n-button>
-              </template>
-              {{ t('shell.dragProject') }}
-            </n-tooltip>
-
-            <!-- 移除项目：图标按钮 + tooltip（顶部弹出，白底浅字，避免遮挡右侧的新建会话图标）；
-                 点击弹 popconfirm 确认（软删除，可同路径恢复） -->
-            <n-tooltip
-              trigger="hover"
-              placement="top"
-              :theme-overrides="tooltipTheme"
-            >
-              <template #trigger>
-                <n-popconfirm
-                  :positive-text="t('common.confirm')"
-                  :negative-text="t('common.cancel')"
-                  @positive-click="onRemoveWorkspace(group.workspace)"
-                >
-                  <template #trigger>
-                    <n-button
-                      text
-                      size="small"
-                      class="text-ink-muted hover:text-red-500"
-                      :aria-label="t('shell.removeProject')"
-                    >
-                      <template #icon>
-                        <n-icon :size="18"><TrashOutline /></n-icon>
-                      </template>
-                    </n-button>
-                  </template>
-                  {{ t('shell.removeProjectConfirm', { name: projectName(group.workspace) }) }}
-                </n-popconfirm>
-              </template>
-              {{ t('shell.removeProject') }}
-            </n-tooltip>
-
-            <!-- 新建会话：图标按钮 + tooltip（顶部弹出，白底浅字）；进入该项目的 /new 空态 -->
-            <n-tooltip
-              trigger="hover"
-              placement="top"
-              :theme-overrides="tooltipTheme"
-            >
-              <template #trigger>
-                <n-button
-                  text
-                  size="small"
-                  class="text-ink-muted hover:text-ink-secondary"
+                  size="tiny"
+                  class="text-ink-muted/50 hover:text-ink-secondary"
                   :aria-label="t('shell.newSession')"
                   @click="onNewSessionInWorkspace(group.workspace.id)"
                 >
                   <template #icon>
-                    <n-icon :size="18"><AddOutline /></n-icon>
+                    <n-icon :size="15"><AddOutline /></n-icon>
                   </template>
                 </n-button>
               </template>
@@ -596,5 +634,21 @@ async function onRemoveWorkspace(ws: Workspace) {
 
     <!-- 无任何项目：引导新建项目 -->
     <n-empty v-else size="small" :description="t('shell.noProjectsHint')" />
+
+    <!-- 移除项目确认框（软删除，同路径再次添加可整体恢复） -->
+    <n-modal
+      v-model:show="removeConfirmVisible"
+      preset="dialog"
+      type="warning"
+      :title="t('shell.removeProject')"
+      :content="
+        pendingRemoveWs
+          ? t('shell.removeProjectConfirm', { name: projectName(pendingRemoveWs) })
+          : ''
+      "
+      :positive-text="t('common.confirm')"
+      :negative-text="t('common.cancel')"
+      @positive-click="onConfirmRemoveWorkspace"
+    />
   </div>
 </template>

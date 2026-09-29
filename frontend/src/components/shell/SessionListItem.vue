@@ -1,14 +1,21 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, h, ref, type Component } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useRoute, useRouter } from 'vue-router'
-import { EllipsisHorizontalOutline } from '@vicons/ionicons5'
-import { useMessage, type DropdownOption } from 'naive-ui'
+import {
+  CopyOutline,
+  CreateOutline,
+  EllipsisHorizontalOutline,
+  EyeOutline,
+  TrashOutline,
+} from '@vicons/ionicons5'
+import { NIcon, useMessage, type DropdownOption } from 'naive-ui'
 import { useAgentStore } from '@/stores/agent'
 import { useAppStore } from '@/stores/app'
 import { useSessionStore } from '@/stores/session'
 import type { ChatSession } from '@/types/models'
 import { formatRelativeTime } from '@/utils/relativeTime'
+import { copyText } from '@/utils/clipboard'
 
 const props = defineProps<{ session: ChatSession }>()
 
@@ -77,29 +84,69 @@ function onSelect() {
   })
 }
 
-// ---------- 操作菜单（hover 显示 ... 按钮，点击展开：重命名 / 删除） ----------
+// ---------- 操作菜单（hover 显示 ... 按钮，点击展开：重命名 / 查看 ID / 复制 ID / 删除） ----------
 
-/** 操作菜单选项：label 用函数保持 i18n 响应式 */
+/** 菜单项统一样式：左侧图标 + 右侧文字，文字用 text-xs 缩小（菜单挂 body，用全局 Tailwind 类） */
+function menuIcon(icon: Component) {
+  return () => h(NIcon, null, { default: () => h(icon) })
+}
+function menuLabel(text: string) {
+  return h('span', { class: 'text-xs' }, text)
+}
+
+/** 操作菜单选项：label/icon 用函数保持 i18n 响应式 */
 const menuOptions: DropdownOption[] = [
-  { label: () => t('shell.rename'), key: 'rename' },
-  { label: () => t('shell.delete'), key: 'delete' },
+  { key: 'rename', icon: menuIcon(CreateOutline), label: () => menuLabel(t('shell.rename')) },
+  { key: 'viewId', icon: menuIcon(EyeOutline), label: () => menuLabel(t('shell.viewSessionId')) },
+  { key: 'copyId', icon: menuIcon(CopyOutline), label: () => menuLabel(t('shell.copySessionId')) },
+  { key: 'delete', icon: menuIcon(TrashOutline), label: () => menuLabel(t('shell.delete')) },
 ]
 
 const renameModalVisible = ref(false)
 const deleteModalVisible = ref(false)
+const idModalVisible = ref(false)
 const renameValue = ref('')
 const renaming = ref(false)
 
 /** 操作菜单展开状态：展开期间保持 ... 按钮可见（避免移开鼠标后按钮消失） */
 const actionsVisible = ref(false)
 
-/** 操作菜单选择分发：重命名开输入弹窗，删除开确认弹窗 */
+/**
+ * 对外展示/复制的会话 ID = Agent（qodercli）侧的 session UUID（acpSessionId），
+ * 即 `qodercli --list-sessions` 看到的 ID，而非 zacp 内部自增数字 id。
+ * 草稿或尚未在 agent 侧建会话时为空 → 查看/复制给出提示而非空串。
+ */
+const externalSessionId = computed(() => props.session.acpSessionId ?? '')
+
+/** 操作菜单选择分发：重命名 / 查看 ID / 复制 ID / 删除 */
 function onMenuSelect(key: string | number) {
   if (key === 'rename') {
     renameValue.value = props.session.title || ''
     renameModalVisible.value = true
+  } else if (key === 'viewId') {
+    if (!externalSessionId.value) {
+      message.warning(t('shell.sessionIdUnavailable'))
+      return
+    }
+    idModalVisible.value = true
+  } else if (key === 'copyId') {
+    void onCopyId()
   } else if (key === 'delete') {
     deleteModalVisible.value = true
+  }
+}
+
+/** 复制会话 ID（agent 侧 UUID）到剪贴板（copyText 内含非 secure context 回退） */
+async function onCopyId() {
+  if (!externalSessionId.value) {
+    message.warning(t('shell.sessionIdUnavailable'))
+    return
+  }
+  const ok = await copyText(externalSessionId.value)
+  if (ok) {
+    message.success(t('shell.copiedSessionId'))
+  } else {
+    message.error(t('shell.copyIdFailed'))
   }
 }
 
@@ -181,7 +228,8 @@ async function onDelete() {
         <span class="shrink-0">{{ relativeTime }}</span>
       </span>
     </div>
-    <!-- hover 显示 ... 按钮：点击展开操作菜单（重命名/删除）；stop 阻止冒泡切换会话 -->
+    <!-- hover 显示 ... 按钮：点击展开操作菜单（重命名/查看 ID/复制 ID/删除）；stop 阻止冒泡切换会话。
+         text 型按钮：hover 无背景（只变色），贴合行内轻量观感 -->
     <n-dropdown
       trigger="click"
       :options="menuOptions"
@@ -190,10 +238,10 @@ async function onDelete() {
       @update:show="(v) => (actionsVisible = v)"
     >
       <n-button
-        quaternary
+        text
         size="tiny"
         circle
-        class="shrink-0 transition-opacity"
+        class="shrink-0 text-ink-muted transition-opacity hover:text-ink"
         :class="actionsVisible ? 'opacity-100' : 'opacity-0 group-hover:opacity-100 pointer-coarse:opacity-100'"
         aria-label="session actions"
         @click.stop
@@ -242,6 +290,21 @@ async function onDelete() {
     :negative-text="t('common.cancel')"
     @positive-click="onDelete"
   />
+
+  <!-- 查看会话 ID：可选中复制，另附一键复制按钮 -->
+  <n-modal
+    v-model:show="idModalVisible"
+    preset="card"
+    :title="t('shell.sessionIdTitle')"
+    style="width: 360px"
+  >
+    <div class="flex items-center justify-between gap-3">
+      <code class="select-all break-all text-sm text-ink">{{ externalSessionId }}</code>
+      <n-button size="tiny" secondary class="shrink-0" @click="onCopyId">
+        {{ t('shell.copySessionId') }}
+      </n-button>
+    </div>
+  </n-modal>
 </template>
 
 <style scoped>

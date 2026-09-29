@@ -223,11 +223,11 @@ onMounted(() => {
 })
 
 // ---------------------------------------------------------------------------
-// 「回到底部」悬浮按钮：滚动时浮现，停止滚动 0.6s 后淡出（避免长期遮挡内容）
+// 「回到底部」悬浮按钮：滚动时浮现，停止滚动约 2s 后淡出（避免长期遮挡内容）
 // ---------------------------------------------------------------------------
 
-/** 停止滚动后按钮的停留时长：留一点余量方便「滚一下再点」，又不会长期挡住内容 */
-const SCROLL_IDLE_HIDE_MS = 600
+/** 停止滚动后按钮的停留时长：留足余量方便「滚一下再点」，又不会长期挡住内容 */
+const SCROLL_IDLE_HIDE_MS = 2000
 const jumpButtonVisible = ref(false)
 let jumpButtonTimer: ReturnType<typeof setTimeout> | undefined
 
@@ -322,7 +322,7 @@ onBeforeUnmount(() => {
     />
 
     <!-- 「回到底部」悬浮按钮：位于对话框正上方居中，样式沿用原回到最底按钮；
-         仅在滚动时浮现（停止滚动 0.6s 后淡出），且已贴底时无意义 → 始终隐藏。
+         仅在滚动时浮现（停止滚动约 2s 后淡出），且已贴底时无意义 → 始终隐藏。
          bottom 偏移加悬浮输入层高度，避免被输入条盖住（--composer-h 由 ChatPane 写入） -->
     <button
       class="absolute bottom-[calc(var(--composer-h,6rem)_+_0.75rem)] left-1/2 z-10 flex h-7 w-7 -translate-x-1/2 cursor-pointer items-center justify-center rounded-full border border-divider bg-surface-raised/90 text-ink-muted shadow-sm backdrop-blur transition-opacity duration-200 hover:bg-surface-hover hover:text-ink"

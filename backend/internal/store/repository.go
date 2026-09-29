@@ -395,6 +395,23 @@ func (r *MessageRepository) ListBySession(sessionID uint) ([]model.Message, erro
 	return messages, err
 }
 
+// FirstUserMessage 返回会话的首条用户消息（created_at 升序）；无则返回 (nil, nil)。
+// 用于按「首条提问」重算派生标题（判断标题是否仍为自动派生、未被手动改名）。
+func (r *MessageRepository) FirstUserMessage(sessionID uint) (*model.Message, error) {
+	var messages []model.Message
+	err := r.db.Where("session_id = ? AND role = ?", sessionID, "user").
+		Order("created_at ASC").
+		Limit(1).
+		Find(&messages).Error
+	if err != nil {
+		return nil, err
+	}
+	if len(messages) == 0 {
+		return nil, nil
+	}
+	return &messages[0], nil
+}
+
 // ListBySessionPaginated 从最新消息开始分页，并将当前窗口按消息 ID 升序返回。
 // offset 以最新端为基准：offset=0 返回最新 limit 条；恢复升序是为了保持聊天 UI 的时间线顺序。
 func (r *MessageRepository) ListBySessionPaginated(sessionID uint, limit, offset int) ([]model.Message, error) {
