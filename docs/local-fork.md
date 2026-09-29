@@ -119,6 +119,7 @@ cd ~/prj/zacp && ./scripts/build.sh
    - 输入条（含 steer 叠层、错误/断线提示条）从流内布局改为**悬浮层**（`ChatPane.vue`：消息区 `relative flex-1` + 浮层 `absolute inset-x-0 bottom-0 z-30`，空白处 `pointer-events-none`），消息可滚到浮层下方，消除「消息区 / 输入框」之间的空白分区带；浮层高度由 `ResizeObserver` 实测写入 `--composer-h`
    - `--composer-h` 消费方：消息列底部留白 `pb-[calc(var(--composer-h,6rem)+1.5rem)]`（最后一条能滚到浮层上方）、「回到底部」按钮 `bottom-[calc(var(--composer-h)+0.75rem)]`、右侧消息导航条改为在「浮层以上」的高度带内垂直居中（`bottom-[calc(var(--composer-h)+0.5rem)]` + `max-h-full`）
    - 宽度对齐：消息区滚动条占布局宽度（实测 `clientWidth 1130` vs `offsetWidth 1140`），输入条不滚动 → 两者 `mx-auto` 居中时消息列整体偏半个滚动条宽。`MessageList` 把滚动条宽度写入 `--msg-scrollbar-w`，输入条外层 `.composer-shell` 按同宽度留白（必须加在 `max-w` 容器之外，否则会压窄卡片）；实测消息列与输入卡片 rect 完全一致（417..1313）
+   - 修复：流式期间新增工具卡/内容时列表未贴底，底部的思考面板会被顶到悬浮输入层下面（等思考文本增长才被拉回）。根因：跟随信号 `messageTick` 只含消息数/正文长度/思考长度，工具卡与流式块变化不在其中；已把「流式块数量」「工具卡数量」纳入信号
    - 已验证（隔离实例 + CDP 几何量测）：`alignLeft/alignRight = 0`、浮层高度 144px 与变量一致、最后一条消息与卡片间距 32px（=留白 24 + 卡片顶距 8）、导航条带 53..748（卡片顶 764 之上）、亮色截图确认无分区空白带
 
 （前批改动验证记录：杀 agent 确认 → 网页删除 → qodercli 会话文件自动删除（进程被按需拉起）；无效会话删除无降级告警；启动耗时隔离环境实测 4446ms → 66ms，真实服务重启健康检查通过。）

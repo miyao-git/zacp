@@ -18,10 +18,21 @@ const scroller = ref<HTMLElement | null>(null)
 const { atBottom, onScroll, scrollToBottom, snapToBottom, followIfAtBottom } =
   useChatScroll(scroller)
 
-/** 消息列表变化信号：长度（追加/刷新）或最后一条内容（流式追加）变化时触发跟随 */
+/**
+ * 消息列表变化信号：长度（追加/刷新）、最后一条内容（流式追加）、思考文本（reasoning）、
+ * 流式块数量与工具卡数量变化时触发跟随。
+ * 工具卡/新块不改变 message.content，若不计入信号，流式中新增工具卡会让消息变高却不贴底，
+ * 底部的思考面板会被顶到悬浮输入层下面（等到思考文本再增长才被「拉回来」）。
+ */
 const messageTick = computed(
   () =>
-    `${sessionStore.activeMessages.length}:${sessionStore.activeMessages.at(-1)?.content.length ?? 0}:${sessionStore.activeMessages.at(-1)?.reasoning?.length ?? 0}`,
+    [
+      sessionStore.activeMessages.length,
+      sessionStore.activeMessages.at(-1)?.content.length ?? 0,
+      sessionStore.activeMessages.at(-1)?.reasoning?.length ?? 0,
+      sessionStore.streamBlocksOf(sessionStore.currentId).length,
+      sessionStore.activeToolCardsOf(sessionStore.currentId).length,
+    ].join(':'),
 )
 
 /** 当前会话消息历史加载状态：未开始（缓存缺失且请求未发）时按加载中处理，
