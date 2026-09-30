@@ -112,7 +112,6 @@ export default {
     reasoning: 'Thought process',
     reasoningThinking: 'Thinking',
     reasoningLoading: 'Loading thoughts…',
-    reasoningFollow: 'Back to latest',
     // Steer queue (messages sent while a turn is running: auto-sent after the turn, editable)
     steerEdit: 'Edit this queued message',
     steerSendHint: 'Queue: sent right after the current turn',
