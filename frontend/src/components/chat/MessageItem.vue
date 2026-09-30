@@ -363,6 +363,13 @@ const copyContent = computed<string>(() => {
 const canCopy = computed(
   () => !isUser.value && isFinished.value && Boolean(copyContent.value.trim()),
 )
+
+/**
+ * 本轮是否产出了可见内容（文本块或工具卡）。
+ * 用于页脚显隐：用户在响应到达前就终止（取消/中断）时，assistant 侧没有任何内容，
+ * 若仍显示页脚就会孤零零冒出一个时间戳。无内容 → 整个页脚（时间 + 复制）都不显示。
+ */
+const hasResponseContent = computed(() => visibleBlocks.value.length > 0)
 </script>
 
 <template>
@@ -476,7 +483,7 @@ const canCopy = computed(
          复制按钮 hover 显示、触屏常显；复制成功短暂切对勾反馈。
          响应时间 = 该 assistant 消息落库时刻（turn 收尾时间），与用户页脚的发送时刻同源。 -->
     <div
-      v-if="!isUser && isFinished"
+      v-if="!isUser && isFinished && hasResponseContent"
       class="-mt-1 flex items-center gap-1 pl-0.5 text-xs leading-4 text-ink-muted"
     >
       <span v-if="sentAt" class="tabular-nums">{{ sentAt }}</span>
