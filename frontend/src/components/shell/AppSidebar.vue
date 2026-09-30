@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { AddOutline, SearchOutline } from '@vicons/ionicons5'
 import { useMessage } from 'naive-ui'
 import SidebarSessionList from '@/components/shell/SidebarSessionList.vue'
@@ -19,6 +19,7 @@ const emit = defineEmits<{
 }>()
 
 const { t } = useI18n()
+const route = useRoute()
 const router = useRouter()
 const sessionStore = useSessionStore()
 const appStore = useAppStore()
@@ -85,17 +86,26 @@ watch(
   },
 )
 
-/** 打开「新建项目」弹窗（受 MAX_WORKSPACES 限制） */
-function onNewProject() {
-  if (sessionStore.workspaces.length >= MAX_WORKSPACES) {
-    message.warning(`项目数量已达上限（${MAX_WORKSPACES}个），请先移除旧项目`)
-    return
-  }
-  projectPath.value = ''
-  showProjectModal.value = true
+/**
+ * 新建会话：主区切到 /new 空态（顶栏按钮的唯一职责）。
+ * 项目归属优先级：当前选中的项目（/new 上已选的项目 → 当前会话所在项目，
+ * 且须仍在项目列表中）→ 列表中第一个项目（侧栏顺序，与首页守卫同口径）；
+ * 都没有（尚无任何项目）时不带 query，由后端回退默认工作目录。
+ * 新建项目入口已移到该页的项目下拉里（appStore.newProjectModalOpen 仍共享本组件弹窗）。
+ */
+function onNewSession() {
+  // 仅接受正整数 id（空/非法/重复 query 一律视为未指定，避免把 NaN 等写回路由）
+  const raw = route.name === 'new' ? Number(route.query.workspaceId) : NaN
+  const selected = [
+    Number.isInteger(raw) && raw > 0 ? raw : undefined,
+    sessionStore.activeSession?.workspaceId,
+  ].find((id) => id !== undefined && sessionStore.workspaces.some((w) => w.id === id))
+  const wsId = selected ?? sessionStore.firstWorkspace()?.id
+  void router.push({
+    name: 'new',
+    ...(wsId !== undefined ? { query: { workspaceId: String(wsId) } } : {}),
+  })
 }
-
-const canAddProject = computed(() => sessionStore.workspaces.length < MAX_WORKSPACES)
 /**
  * 提交项目路径：POST /api/v1/workspaces（后端校验路径存在 + 自动取末尾段为 name）。
  * 创建成功后直接进入该项目的「新建会话」空态（/new?workspaceId=X），少一步点击。
@@ -134,18 +144,15 @@ async function onCreateProject() {
     :inert="!open && !desktop"
   >
     <div class="flex flex-col gap-2 pt-[max(env(safe-area-inset-top),0.75rem)] pl-[max(env(safe-area-inset-left),0.75rem)] pr-3 pb-3">
-      <!-- 新建项目：Tailwind 实现的次级按钮（点击打开与 WelcomeHero 共享的项目弹窗）。
-           注意：不做单独的抽屉关闭按钮——点遮罩区域即可关闭（移动端交互更轻）
-           超过 MAX_WORKSPACES 时按钮禁用并提示 -->
+      <!-- 新建会话：主区进入 /new 空态（项目在该页的项目下拉里可改；新建项目入口也在那里）。
+           注意：不做单独的抽屉关闭按钮——点遮罩区域即可关闭（移动端交互更轻） -->
       <button
         type="button"
-        class="flex w-full cursor-pointer items-center justify-center gap-1.5 rounded-lg border border-divider bg-surface-raised px-3 py-2 text-sm font-medium transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-divider disabled:cursor-not-allowed disabled:opacity-50"
-        :class="canAddProject ? 'text-ink-secondary shadow-sm hover:border-divider hover:bg-surface-hover' : 'text-ink-muted'"
-        :title="!canAddProject ? `项目数量已达上限（${MAX_WORKSPACES}个）` : undefined"
-        @click="onNewProject"
+        class="flex w-full cursor-pointer items-center justify-center gap-1.5 rounded-lg border border-divider bg-surface-raised px-3 py-2 text-sm font-medium text-ink-secondary shadow-sm transition-colors hover:border-divider hover:bg-surface-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-divider"
+        @click="onNewSession"
       >
         <AddOutline class="h-4 w-4 shrink-0" />
-        {{ t('shell.newProject') }}
+        {{ t('shell.newSession') }}
       </button>
 
       <!-- 会话搜索：标题 + 对话正文（跨项目）。中文输入法组字期间 NInput 不发

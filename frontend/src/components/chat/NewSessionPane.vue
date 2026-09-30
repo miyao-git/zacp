@@ -12,14 +12,16 @@
  * 设计约束：侧栏只展示转正后的会话；草稿不进列表。
  * A 方案代价：每次切 tab = 真实 session/new（启动 agent 子进程），有启动延迟。
  */
-import { computed, nextTick, onUnmounted, ref, watch } from 'vue'
+import { computed, h, nextTick, onUnmounted, ref, watch } from 'vue'
 import { NIcon } from 'naive-ui'
-import { WarningOutline } from '@vicons/ionicons5'
+import type { DropdownOption } from 'naive-ui'
+import { AddOutline, CheckmarkOutline, WarningOutline } from '@vicons/ionicons5'
 import { useI18n } from 'vue-i18n'
 import { useRouter } from 'vue-router'
 import { useAgentStore } from '@/stores/agent'
 import { useAppStore } from '@/stores/app'
 import { useSessionStore } from '@/stores/session'
+import { projectName } from '@/utils/workspace'
 import type { ChatSession, ConfigOption } from '@/types/models'
 import Composer, {
   type ComposerSubmitPayload,
@@ -44,14 +46,61 @@ function goSettings() {
   appStore.settingsOpen = true
 }
 
-/** 当前工作区路径（空态提示用）：优先 ?workspaceId 指定的工作区，缺省回退默认工作区 */
-const workspacePath = computed(() => {
+/**
+ * 当前会话归属项目：优先 ?workspaceId 指定的项目（路由显式指定，草稿也按它创建），
+ * 缺省/已失效时回退默认项目；无任何项目时为 undefined（提示行隐藏）。
+ */
+const currentWorkspace = computed(() => {
   const ws =
     props.workspaceId != null
       ? sessionStore.workspaces.find((w) => w.id === props.workspaceId)
       : undefined
-  return (ws ?? sessionStore.defaultWorkspace())?.path ?? ''
+  return ws ?? sessionStore.defaultWorkspace()
 })
+
+/** 当前项目显示名（下拉触发器文案） */
+const currentProjectName = computed(() =>
+  currentWorkspace.value ? projectName(currentWorkspace.value) : '',
+)
+
+/**
+ * 项目下拉选项：全部项目（当前项打勾）+ 分隔线 + 「新建项目」入口。
+ * 当前项不可选（onProjectSelect 内跳过，避免重复重建草稿）。
+ */
+const projectOptions = computed<DropdownOption[]>(() => {
+  const items: DropdownOption[] = sessionStore.workspaces.map((w) => ({
+    key: w.id,
+    label: projectName(w),
+    icon:
+      w.id === currentWorkspace.value?.id
+        ? () => h(NIcon, null, { default: () => h(CheckmarkOutline) })
+        : undefined,
+  }))
+  items.push({ type: 'divider', key: 'divider' })
+  items.push({
+    key: 'new-project',
+    label: t('shell.newProject'),
+    icon: () => h(NIcon, null, { default: () => h(AddOutline) }),
+  })
+  return items
+})
+
+/**
+ * 项目下拉选择：切项目 → 只改路由 query（?workspaceId），
+ * 由下方 props.workspaceId watch 统一重建草稿（含释放旧草稿）；
+ * 选「新建项目」→ 打开与侧栏共享的新建项目弹窗（AppSidebar 监听同一 flag）。
+ */
+function onProjectSelect(key: string | number) {
+  if (key === 'new-project') {
+    appStore.newProjectModalOpen = true
+    return
+  }
+  const id = Number(key)
+  if (!Number.isFinite(id) || id === currentWorkspace.value?.id) {
+    return
+  }
+  void router.replace({ name: 'new', query: { workspaceId: String(id) } })
+}
 
 /** 当前选中的 agent id（默认第一个可用 running agent） */
 const selectedAgentId = ref('')
@@ -281,9 +330,12 @@ onUnmounted(() => {
           >
             {{ t('chat.welcomeSubtitle') }}
           </h1>
-          <!-- 灰色工作区提示：告知用户会话将创建在哪个目录下 -->
-          <p v-if="workspacePath" class="text-sm text-ink-muted">
-            {{ t('chat.newSessionPathHint', { path: workspacePath }) }}
+          <!-- 项目提示行：会话将创建在所选项目下；项目名带下划线可点开下拉切换项目
+               （含「新建项目」入口）。字号与下方 agent 选择器一致（text-sm）。
+               模板保持单行：中英文语序不同（中文项目名在句中、英文在句尾），
+               项目名两侧间距交给按钮的 mx-1，避免空白文本节点被编译器裁掉 -->
+          <p v-if="currentWorkspace" class="text-sm text-ink-muted">
+            {{ t('chat.newSessionUnderPrefix') }}<n-dropdown trigger="click" :options="projectOptions" @select="onProjectSelect"><button type="button" class="mx-1 cursor-pointer font-medium text-ink underline decoration-ink-muted underline-offset-2 transition-colors hover:decoration-ink" :title="currentWorkspace.path">{{ currentProjectName }}</button></n-dropdown>{{ t('chat.newSessionUnderSuffix') }}
           </p>
         </div>
 

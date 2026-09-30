@@ -96,7 +96,9 @@ export default {
     welcomeSubtitle: 'Please pick an agent',
     filesTitle: 'Files',
     configTitle: 'Session settings',
-    newSessionPathHint: 'The session will be created under {path}',
+    // 项目提示行：项目名由模板插在中间（可点击下拉切换项目）
+    newSessionUnderPrefix: 'The session will be created under',
+    newSessionUnderSuffix: '',
     loadingAgent: 'Starting the agent…',
     creatingSession: 'Creating session…',
     agentNotRunning: 'Not running, click to start',
