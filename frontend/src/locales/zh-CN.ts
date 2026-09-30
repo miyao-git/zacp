@@ -117,6 +117,9 @@ export default {
     // 会话回退（编辑历史消息后重发：先把对话与文件回退到该消息之前）
     rewindEdit: '编辑',
     rewindHint: '发送前会回退到这条消息之前（对话与文件改动一并撤销）',
+    // 一键复制 AI 回复（原始 markdown）
+    copy: '复制',
+    copied: '已复制',
     placeholder: '给 Agent 发送消息…',
     enterHint: 'Enter 发送 · Shift+Enter 换行',
     send: '发送',

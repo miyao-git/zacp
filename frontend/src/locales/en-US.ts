@@ -118,6 +118,9 @@ export default {
     // Conversation rewind (edit a past message and resend: rewinds chat and files first)
     rewindEdit: 'Edit',
     rewindHint: 'Sending rewinds to before this message (undoes the conversation and file changes)',
+    // One-click copy of the AI reply (raw markdown)
+    copy: 'Copy',
+    copied: 'Copied',
     placeholder: 'Message the agent…',
     enterHint: 'Enter to send · Shift+Enter for a new line',
     send: 'Send',

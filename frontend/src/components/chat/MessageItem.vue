@@ -1,10 +1,11 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { IncremarkContent } from '@incremark/vue'
-import { CreateOutline } from '@vicons/ionicons5'
+import { CheckmarkOutline, CopyOutline, CreateOutline } from '@vicons/ionicons5'
 import { NIcon } from 'naive-ui'
 import { fetchMessageThoughts } from '@/api'
+import { copyText } from '@/utils/clipboard'
 import type { ChatMessage, ToolDetailsMap } from '@/types/models'
 import type { WsEvent } from '@/types/ws'
 import type { ToolCard } from '@/stores/session'
@@ -176,6 +177,24 @@ const isStreamingPlaceholder = computed(
     sessionStore.activeMessages.at(-1)?.id === props.message.id,
 )
 
+/** 复制成功后的短暂「已复制」反馈（图标切对勾，1.5s 后自动复原） */
+const copied = ref(false)
+let copiedTimer: ReturnType<typeof setTimeout> | undefined
+
+async function onCopy() {
+  const ok = await copyText(copyContent.value)
+  if (!ok) {
+    return
+  }
+  copied.value = true
+  clearTimeout(copiedTimer)
+  copiedTimer = setTimeout(() => {
+    copied.value = false
+  }, 1500)
+}
+
+onBeforeUnmount(() => clearTimeout(copiedTimer))
+
 /**
  * 思考窗口内容变化统一处理：
  * - 内容增长（流式追加 / 异步加载完成）→ 滚到底部，保证窗口里始终是最新 5 行；
@@ -310,6 +329,40 @@ const blocks = computed<MessageBlock[]>(() => {
 const visibleBlocks = computed<MessageBlock[]>(() =>
   blocks.value.filter((b) => b.kind !== 'text' || Boolean(b.content && b.content.trim())),
 )
+
+/**
+ * 一键复制的内容：本轮回复的**最终正文**（原始 markdown），不含工具调用之间的过程性
+ * 旁白（如「Let me read the key files…」）。
+ *
+ * 为什么不能按类型取：ACP 里过程旁白与最终答复都是同一种 `agent_message_chunk`
+ *（见 client.go SessionUpdate），协议层没有「旁白 / 正文」之分；唯一被单独区分的是
+ * `agent_thought_chunk`（思考过程），那部分本就不在 content 里（单独渲染在思考面板）。
+ * 因此这里用**位置启发式**：正文 = 最后一次工具调用之后的文本块。绝大多数 agent 的
+ * 收尾答复都发生在所有工具调用之后，正好对应这段尾部文本；没有任何工具调用时
+ *（lastTool = -1）即拼接全部文本块 = 完整正文。尾部为空（回复以工具调用结束、无收尾
+ * 文本）时回退到完整 content，保证复制不为空。
+ */
+const copyContent = computed<string>(() => {
+  const bs = blocks.value
+  let lastTool = -1
+  for (let i = 0; i < bs.length; i++) {
+    if (bs[i].kind === 'tool') lastTool = i
+  }
+  let tail = ''
+  for (let i = lastTool + 1; i < bs.length; i++) {
+    const b = bs[i]
+    if (b.kind === 'text') tail += b.content
+  }
+  return tail.trim() ? tail : (props.message.content ?? '')
+})
+
+/**
+ * 是否显示一键复制：仅 AI 回复、本轮响应已结束（isFinished，流式期间不显示以免复制到
+ * 半截内容）、且确有可复制正文时可用。
+ */
+const canCopy = computed(
+  () => !isUser.value && isFinished.value && Boolean(copyContent.value.trim()),
+)
 </script>
 
 <template>
@@ -417,6 +470,30 @@ const visibleBlocks = computed<MessageBlock[]>(() =>
         {{ reasoningLoadState === 'loading' ? t('chat.reasoningLoading') : reasoning }}
       </div>
     </details>
+
+    <!-- AI 回复页脚：响应时间（最左）+ 一键复制（hover 时出现在时间右侧）。
+         与用户消息的「编辑/回退」页脚同一套样式与逻辑：整条页脚在本轮响应结束后出现，
+         复制按钮 hover 显示、触屏常显；复制成功短暂切对勾反馈。
+         响应时间 = 该 assistant 消息落库时刻（turn 收尾时间），与用户页脚的发送时刻同源。 -->
+    <div
+      v-if="!isUser && isFinished"
+      class="-mt-1 flex items-center gap-1 pl-0.5 text-xs leading-4 text-ink-muted"
+    >
+      <span v-if="sentAt" class="tabular-nums">{{ sentAt }}</span>
+      <button
+        v-if="canCopy"
+        type="button"
+        class="flex cursor-pointer items-center rounded p-1 opacity-0 transition-opacity group-hover:opacity-100 hover:bg-surface-hover hover:text-ink-secondary focus:outline-none focus-visible:opacity-100 focus-visible:ring-2 focus-visible:ring-primary/50 pointer-coarse:opacity-100"
+        :aria-label="t('chat.copy')"
+        :title="copied ? t('chat.copied') : t('chat.copy')"
+        @click="onCopy"
+      >
+        <n-icon :size="14">
+          <CheckmarkOutline v-if="copied" />
+          <CopyOutline v-else />
+        </n-icon>
+      </button>
+    </div>
   </div>
 </template>
 
