@@ -196,6 +196,21 @@ const text = ref('')
 const selectedAgentId = ref(props.agentId ?? '')
 const inputRef = ref<InputInst | null>(null)
 
+/**
+ * 输入框自适应高度配置：必须保持**引用稳定**（不能写成内联对象字面量）。
+ *
+ * 原因（实测复现）：内联 `:autosize="{...}"` 每次渲染都是新对象，n-input 会因此
+ * 跟着父组件一起重渲染；而 n-input 重渲染会把 textarea 的 DOM value 同步回
+ * 「已上屏」的模型值——中文输入法组合中（拼音还没上屏时）DOM value 领先于模型值，
+ * 这次同步就会清掉未上屏的拼音、并把光标甩到文字末尾（表现为「打字光标不稳定，
+ * 常跳到末尾或清空拼音」）。流式响应期间 Composer 每秒都因计时器重渲染，
+ * 命中概率因此很高。computed 只在 mode 变化时产生新对象，引用稳定。
+ */
+const inputAutosize = computed(() => ({
+  minRows: props.mode === 'card' ? 3 : 2,
+  maxRows: 8,
+}))
+
 /** 移动端配置面板开关：手机端配置项收进底部抽屉（进入按钮在发送按钮左侧，lg 及以上不显示） */
 const configPanelOpen = ref(false)
 /** 抽屉高度（px，动态测量）：打开前用占位值避免首次弹出抖动 */
@@ -344,13 +359,41 @@ async function pasteUpload(file: File) {
   }
 }
 
+/** 取 n-input 内部的 textarea 元素（naive 通过 expose 暴露 textareaElRef） */
+function textareaEl(): HTMLTextAreaElement | null {
+  return (
+    inputRef.value as unknown as { textareaElRef?: HTMLTextAreaElement } | null
+  )?.textareaElRef ?? null
+}
+
+/**
+ * 输入法组合（拼音未上屏）期间把 DOM 值同步进模型，避免被 n-input 重渲染回写覆盖。
+ *
+ * 根因（实测复现）：n-input 把 textarea 的 value 绑定到模型值，而 Vue 打补丁时
+ * 比较的是 **DOM 值**——组合期间 DOM 里已经是「已上屏文字 + 拼音」，模型还停在
+ * 已上屏文字（n-input 要等 compositionend 才提交），两者一旦不等，任何一次重渲染
+ * 都会把 DOM 写回模型值：拼音被清空、光标跳到文字末尾。触发重渲染的场景很多：
+ * 流式期间 Composer 每秒因计时器重渲染；空输入框开始组合时 n-input 自身也会因
+ * 占位符显隐翻转而重渲染。因此只要「边看回复边打拼音」就很容易踩中。
+ * 这里在原生 input 事件（组合期间同样派发）里把 DOM 值写回模型，让二者始终一致，
+ * 重渲染比较时值相等 → 不再回写 → 组合内容与光标位置保持稳定。
+ * 非组合输入不处理：那是 n-input 的 v-model 正常路径，无需干预。
+ */
+function onCompositionInput(e: Event) {
+  if (!(e as InputEvent).isComposing) {
+    return
+  }
+  const el = e.target as HTMLTextAreaElement | null
+  if (el && text.value !== el.value) {
+    text.value = el.value
+  }
+}
+
 /** 聚焦输入框并把光标移到文本末尾（rAF 保证 DOM 已按新 value 更新后再设光标） */
 function focusInputAtEnd() {
   requestAnimationFrame(() => {
     inputRef.value?.focus()
-    const el = (
-      inputRef.value as unknown as { textareaElRef?: HTMLTextAreaElement }
-    ).textareaElRef
+    const el = textareaEl()
     if (el) el.setSelectionRange(text.value.length, text.value.length)
   })
 }
@@ -522,6 +565,9 @@ function pickSlashCommand(index?: number) {
 /** 新建会话空态（card）自动聚焦输入框：进入 /new 即可直接打字。
  * rAF 延后到布局稳定后再聚焦，避免被遮罩/过渡干扰。 */
 onMounted(() => {
+  // 组合期间同步 DOM 值（见 onCompositionInput 的根因说明）：直接监听原生 textarea，
+  // n-input 在组合期间不派发自身的 onInput，必须绕过它这一层。
+  textareaEl()?.addEventListener('input', onCompositionInput)
   if (props.mode === 'card') {
     requestAnimationFrame(() => inputRef.value?.focus())
   }
@@ -574,7 +620,10 @@ watch(
   { immediate: true },
 )
 
-onBeforeUnmount(stopElapsedTimer)
+onBeforeUnmount(() => {
+  textareaEl()?.removeEventListener('input', onCompositionInput)
+  stopElapsedTimer()
+})
 
 /** bar 模式会话切换时同步外部 agentId */
 watch(
@@ -742,7 +791,7 @@ function onKeydown(e: KeyboardEvent) {
       type="textarea"
       class="composer-input"
       :bordered="false"
-      :autosize="{ minRows: mode === 'card' ? 3 : 2, maxRows: 8 }"
+      :autosize="inputAutosize"
       :placeholder="t('chat.placeholder')"
       :disabled="turnLimited"
       @keydown="onKeydown"
