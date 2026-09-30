@@ -278,7 +278,14 @@ onBeforeUnmount(() => {
 <template>
   <!-- 外层 relative + h-full：为右侧导航条/回到底部按钮提供视口锚点，滚动容器在内部 -->
   <div class="relative h-full min-h-0">
-    <div ref="scroller" class="h-full overflow-y-auto" @scroll="handleScroll">
+    <!-- scrollbar-gutter:stable 恒定预留滚动条槽位：长会话有经典滚动条、短会话没有时，
+         clientWidth 相差一个滚动条宽，居中的消息列/输入框会随会话切换左右跳动；
+         预留后宽度恒定（--msg-scrollbar-w 也随之稳定），浮层滚动条（macOS）下槽位为 0 不受影响 -->
+    <div
+      ref="scroller"
+      class="h-full overflow-y-auto [scrollbar-gutter:stable]"
+      @scroll="handleScroll"
+    >
       <!-- 左右内边距与底部输入条一致（px-3 lg:px-0）：消息列与输入框卡片同宽，
            工具卡/正文的左右边缘与输入框描边对齐；safe-area 由外层容器承担。
            底部额外留白 = 悬浮输入层高度 + 64px（--composer-h 由 ChatPane 实测写入）：

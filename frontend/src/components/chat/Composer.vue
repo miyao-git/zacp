@@ -1,3 +1,11 @@
+<script lang="ts">
+/**
+ * 会话级输入草稿（模块级：bar 模式 Composer 跨会话复用同一实例、路由切换时
+ * 也可能卸载重建，放在组件实例外才能在会话间各自保存/恢复，互不串写）。
+ */
+const sessionDrafts = new Map<number, string>()
+</script>
+
 <script setup lang="ts">
 import { computed, h, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import type { VNodeChild } from 'vue'
@@ -640,6 +648,27 @@ watch(
   },
 )
 
+/**
+ * 会话切换时的草稿隔离：把离开会话的输入内容存进模块级草稿表，再恢复进入会话的草稿。
+ * bar 模式 Composer 跨会话复用同一实例（不重建），若不做隔离，A 会话未发送的文本
+ * 会原样带到 B 会话。card 模式（sessionId=undefined，新建空态）不参与——它有自己的
+ * 隐式草稿会话机制，切走即丢弃。immediate：首帧进入某会话时也恢复其历史草稿。
+ */
+watch(
+  () => props.sessionId,
+  (id, oldId) => {
+    if (oldId !== undefined) {
+      if (text.value) {
+        sessionDrafts.set(oldId, text.value)
+      } else {
+        sessionDrafts.delete(oldId)
+      }
+    }
+    text.value = (id !== undefined ? sessionDrafts.get(id) : '') ?? ''
+  },
+  { immediate: true },
+)
+
 /** 可发送：bar 模式不要求 Agent（沿用当前会话）；card 模式必须已选 Agent；上传文件期间禁止发送；轮次达上限禁止发送 */
 const canSend = computed(
   () =>
@@ -901,7 +930,10 @@ function onKeydown(e: KeyboardEvent) {
         </button>
       </div>
 
-      <div class="flex shrink-0 items-center gap-2">
+      <!-- 右侧操作区（持续时间/排队/停止按钮）：min-h-6 与停止按钮（h-6=24px）等高，
+           保证 idle（内部全空、否则塌成 0）与响应中两种状态行高一致，避免 message 框
+           随「有无停止按钮」上下跳动。移动端整行由左侧 h-9 工具组主导，不受此约束影响。 -->
+      <div class="flex min-h-6 shrink-0 items-center gap-2">
         <!-- 当轮持续时间（m:ss）：turn 进行中显示在停止按钮左侧。
              mr-2 在容器 gap-2 之外再拉开一档：计时数字紧贴红色圆按钮时两者容易糊成一块 -->
         <span

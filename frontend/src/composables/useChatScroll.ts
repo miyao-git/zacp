@@ -3,6 +3,12 @@ import { onBeforeUnmount, onMounted, ref, type Ref } from 'vue'
 /** 距底部小于该像素值视为「在底部」 */
 const NEAR_BOTTOM_PX = 40
 
+/**
+ * 平滑滚动动画的兜底时长：动画期间内容持续增高（流式）时，目标位置一直在变，
+ * 等不到「到底」的 scroll 事件也要在此时限后恢复硬跟随，避免永久抑制贴底。
+ */
+const SMOOTH_SCROLL_GUARD_MS = 1000
+
 /** 判定为「用户主动上翻」的按键（下翻/到底由 scroll 事件恢复跟随，无需列举） */
 const SCROLL_UP_KEYS = new Set(['PageUp', 'Home', 'ArrowUp'])
 
@@ -41,6 +47,21 @@ export function useChatScroll(
   /** 触摸起点 Y（判定手指下拉 = 上翻历史） */
   let touchStartY = 0
   let resizeObserver: ResizeObserver | null = null
+  /**
+   * 平滑滚动动画进行中：期间必须抑制 followIfAtBottom 的硬贴底——
+   * 直接写 scrollTop 会立刻取消浏览器的 smooth 动画（表现为「回到底部」按钮
+   * 失去滚动动画、瞬间硬切到底）。流式输出时内容每帧增高，ResizeObserver /
+   * messageTick 会高频触发贴底，不抑制就完全看不到动画。
+   * 解除时机：滚动到底（onScroll 判定）、用户上滚打断（浏览器同时会取消动画）、
+   * 兜底超时（动画没到底但内容还在长的场景，见 SMOOTH_SCROLL_GUARD_MS）。
+   */
+  let smoothScrolling = false
+  let smoothScrollTimer: ReturnType<typeof setTimeout> | undefined
+
+  function stopSmoothScrollGuard() {
+    smoothScrolling = false
+    clearTimeout(smoothScrollTimer)
+  }
 
   function isNearBottom(): boolean {
     const el = scroller.value
@@ -66,6 +87,19 @@ export function useChatScroll(
       return
     }
     atBottom.value = true
+    if (smooth) {
+      // 开启平滑动画：置抑制标记，动画期间屏蔽 followIfAtBottom 的硬贴底，
+      // 并挂兜底超时（内容持续增高时可能等不到「到底」的 scroll 事件）。
+      smoothScrolling = true
+      clearTimeout(smoothScrollTimer)
+      smoothScrollTimer = setTimeout(() => {
+        smoothScrolling = false
+        // 超时后若内容又长高了，补一次硬贴底，避免停在半途不再跟随
+        followIfAtBottom()
+      }, SMOOTH_SCROLL_GUARD_MS)
+    } else {
+      stopSmoothScrollGuard()
+    }
     el.scrollTo({ top: el.scrollHeight, behavior: smooth ? 'smooth' : 'auto' })
   }
 
@@ -76,11 +110,16 @@ export function useChatScroll(
    */
   function snapToBottom() {
     atBottom.value = true
+    stopSmoothScrollGuard()
     pinToBottom()
   }
 
   /** 内容变化后调用：跟随中则贴底，否则保持用户位置 */
   function followIfAtBottom() {
+    // 平滑动画进行中不硬贴底：写 scrollTop 会取消动画，导致「回到底部」硬切
+    if (smoothScrolling) {
+      return
+    }
     if (atBottom.value) {
       pinToBottom()
     }
@@ -90,6 +129,8 @@ export function useChatScroll(
   function onScroll() {
     if (isNearBottom()) {
       atBottom.value = true
+      // 平滑动画自然到底：解除抑制，后续内容增高恢复硬贴底跟随
+      stopSmoothScrollGuard()
       return
     }
     // 内容长高把 scrollTop clamp、异步渲染撑高都会派发 scroll 事件，
@@ -103,6 +144,8 @@ export function useChatScroll(
     const el = scroller.value
     if (e.deltaY < 0 && el && el.scrollTop > 0) {
       atBottom.value = false
+      // 用户上滚打断平滑动画（浏览器亦会取消动画），解除抑制避免随后硬拽回底
+      stopSmoothScrollGuard()
     }
     // 下滚不预判：惯性滚动结束后由 scroll 事件的「到底」判定恢复跟随
   }
@@ -184,6 +227,7 @@ export function useChatScroll(
     }
     window.removeEventListener('pointerup', onPointerUp)
     window.removeEventListener('pointercancel', onPointerUp)
+    clearTimeout(smoothScrollTimer)
     resizeObserver?.disconnect()
     resizeObserver = null
   })
