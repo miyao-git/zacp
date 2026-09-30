@@ -97,8 +97,6 @@ watch(
 // 用户消息导航条（右侧横杠 + hover 预览，替代原「回到顶部/底部」双按钮）
 // ---------------------------------------------------------------------------
 
-/** 视口顶部下方的判定带：距容器顶 48px 内即视为「该消息已进入阅读位置」 */
-const ACTIVE_NAV_OFFSET_PX = 48
 /** 跳转后在目标消息上方保留的余量（避免标题紧贴容器上沿） */
 const JUMP_TOP_MARGIN_PX = 12
 
@@ -124,7 +122,11 @@ const userNavItems = computed(() => {
 const activeNavIndex = ref(-1)
 
 /**
- * 重算当前项：取「元素顶边已越过视口顶部判定带」的最后一条用户消息。
+ * 重算当前项：取「第一条与视口相交（即前台可见）」的用户消息，多条可见时取最上面一条。
+ * 不能用「顶边越过视口顶部」判定——视口显示「上一轮响应 + 新一轮用户消息」时，
+ * 新一轮消息虽完全可见但顶边在视口内靠下，会被误判为上一轮。
+ * 若视口内一条用户消息都没有（正读某轮超长回复，上下两条用户消息都在视口外），
+ * 回退为「最后一条已完全滚过视口顶部的用户消息」，即正在阅读的那一轮。
  * 元素通过 data-msg-id 与导航项按 id 对齐（跳过被过滤掉的空消息），
  * DOM 顺序即时间顺序，因此可直接线性扫描。
  */
@@ -134,18 +136,26 @@ function updateActiveNavIndex() {
     return
   }
   const indexById = new Map(userNavItems.value.map((item, i) => [item.id, i]))
-  const threshold = el.getBoundingClientRect().top + ACTIVE_NAV_OFFSET_PX
+  const viewTop = el.getBoundingClientRect().top
+  const viewBottom = viewTop + el.clientHeight
   let active = -1
+  let lastAbove = -1
   for (const node of el.querySelectorAll<HTMLElement>('[data-msg-id]')) {
     const index = indexById.get(Number(node.dataset.msgId))
     if (index === undefined) {
       continue
     }
-    if (node.getBoundingClientRect().top <= threshold) {
+    const rect = node.getBoundingClientRect()
+    // 第一条可见项即结果，后续（更靠下）的无需再算
+    if (rect.bottom > viewTop && rect.top < viewBottom) {
       active = index
+      break
+    }
+    if (rect.bottom <= viewTop) {
+      lastAbove = index
     }
   }
-  activeNavIndex.value = active
+  activeNavIndex.value = active >= 0 ? active : lastAbove
 }
 
 /** 跳转到第 index 条用户消息（平滑滚动） */
