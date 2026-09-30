@@ -196,6 +196,16 @@ func (h *Handler) BroadcastTurnStarted(sessionID string) {
 	})
 }
 
+// BroadcastRewindDone 向指定会话广播回退成功：deletedFromID 为被回退掉的第一条消息 id（含），
+// 前端据此丢弃本地 id >= 该值的消息，与 agent 侧的分支切换保持一致。
+func (h *Handler) BroadcastRewindDone(sessionID string, deletedFromID uint) {
+	h.BroadcastToSession(sessionID, ServerMessage{
+		Type:                 MsgTypeRewindDone,
+		SessionID:            sessionID,
+		DeletedFromMessageID: deletedFromID,
+	})
+}
+
 // BroadcastPermissionRequest 向指定会话广播权限请求（携带 sessionId）
 func (h *Handler) BroadcastPermissionRequest(sessionID, permissionID string, toolCall, options interface{}) {
 	h.BroadcastToSession(sessionID, ServerMessage{

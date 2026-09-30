@@ -312,11 +312,16 @@ func (r *SessionRepository) UpdateStatus(id uint, status model.SessionStatus) er
 		Update("status", status).Error
 }
 
-// UpdateTitle 更新会话标题
+// UpdateTitle 更新会话标题。
+//
+// 用 UpdateColumn 而非 Update：GORM 的 Update 会自动刷新 updated_at，而 updated_at
+// 是侧栏展示与排序用的「最后对话时间」——改标题（用户重命名、进入会话时同步 qoder 侧
+// 标题、agent 推送 AI 总结标题）都不是对话活动，不该把会话顶到列表最前。
+// 真实的活跃时间由 Touch 显式维护（每轮 prompt 收尾时调用）。
 func (r *SessionRepository) UpdateTitle(id uint, title string) error {
 	return r.db.Model(&model.Session{}).
 		Where("id = ?", id).
-		Update("title", title).Error
+		UpdateColumn("title", title).Error
 }
 
 // UpdateConfigOptions 更新会话配置项 JSON（模型/思考强度/mode 等）
@@ -537,4 +542,48 @@ func (r *MessageRepository) GetBySessionAndID(sessionID, messageID uint) (*model
 func (r *MessageRepository) DeleteBySession(sessionID uint) error {
 	return r.db.Where("session_id = ?", sessionID).
 		Delete(&model.Message{}).Error
+}
+
+// UpdateAgentMessageID 回写消息在 agent 侧的 id（`/rewind` 的锚点，见 model.Message.AgentMessageID）。
+func (r *MessageRepository) UpdateAgentMessageID(messageID uint, agentMessageID string) error {
+	return r.db.Model(&model.Message{}).
+		Where("id = ?", messageID).
+		Update("agent_message_id", agentMessageID).Error
+}
+
+// CorrectAgentMessageID 把会话下 agent 侧 id 为 from 的那条消息改写为 to。
+// 用于 turn 结束后以 agent 回传的 userMessageId 为准校正客户端发号：
+// 不采纳 messageId 的 agent 会自行分配，此时按回传值改写，否则存下来的锚点
+// 指向不存在的消息，rewind 必然失败。按旧值定位而非主键：排队轮次里
+// 用户消息的行 id 不在执行路径上，旧值是本轮唯一且已知的标识。
+func (r *MessageRepository) CorrectAgentMessageID(sessionID uint, from, to string) error {
+	if from == "" || from == to {
+		return nil
+	}
+	return r.db.Model(&model.Message{}).
+		Where("session_id = ? AND agent_message_id = ?", sessionID, from).
+		Update("agent_message_id", to).Error
+}
+
+// ListUserMessageAnchors 返回会话下全部用户消息的对齐用轻量字段（按 id 升序）。
+// 供 rewind 锚点回填使用：只取 id/role/content/agent_message_id，不带 events 与
+// tool_details（那两列可能是几十 KB 的 JSON，全量加载会白吃内存）。
+func (r *MessageRepository) ListUserMessageAnchors(sessionID uint) ([]model.Message, error) {
+	var messages []model.Message
+	err := r.db.Model(&model.Message{}).
+		Select("id", "session_id", "role", "content", "agent_message_id", "created_at").
+		Where("session_id = ? AND role = ?", sessionID, "user").
+		Order("id ASC").
+		Find(&messages).Error
+	return messages, err
+}
+
+// DeleteFromID 删除会话下 id >= messageID 的全部消息，返回删除条数。
+// rewind 的语义是「回退到该消息之前」：目标用户消息本身连同其后的所有消息
+//（本轮助手回复、以及更晚的轮次）一并移除，与 agent 侧的分支切换保持一致。
+// 用自增 id 而非 created_at 比较：同秒创建的多条消息时间戳可能相同，id 严格单调。
+func (r *MessageRepository) DeleteFromID(sessionID, messageID uint) (int64, error) {
+	tx := r.db.Where("session_id = ? AND id >= ?", sessionID, messageID).
+		Delete(&model.Message{})
+	return tx.RowsAffected, tx.Error
 }

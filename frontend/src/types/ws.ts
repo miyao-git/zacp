@@ -11,6 +11,8 @@ export type WsClientMessage =
   | { type: 'cancel'; sessionId: string; agentId: string }
   | { type: 'resync'; sessionId: string; agentId: string }
   | { type: 'permission'; permissionId: string; optionId: string }
+  /** 回退到某条用户消息之前；targetMessageId 是 zacp 的 messages.id（非 agent uuid） */
+  | { type: 'rewind'; sessionId: string; agentId: string; targetMessageId: number }
   | { type: 'ping' }
 
 /** 计划任务步骤（ACP plan 事件 entries 项；对齐 client.PlanStep） */
@@ -108,5 +110,10 @@ export type WsServerMessage =
       running?: boolean
       replay?: TurnReplay
     }
+  /**
+   * 回退成功：deletedFromMessageId 为被回退掉的第一条消息 id（含），
+   * 前端丢弃本地 id >= 该值的消息（对齐后端 DeleteFromID 口径）。
+   */
+  | { type: 'rewind.done'; sessionId?: string; deletedFromMessageId?: number }
   | { type: 'error'; sessionId?: string; code?: string; message?: string }
   | { type: 'pong' }

@@ -81,7 +81,7 @@ func (h *ChatHandler) Chat(c *gin.Context) {
 		sessionID = newSessionID
 	}
 
-	result, err := h.Mgr.Prompt(c.Request.Context(), agentID, sessionID, req.Message)
+	result, err := h.Mgr.Prompt(c.Request.Context(), agentID, sessionID, req.Message, manager.PromptOptions{})
 	if err != nil {
 		c.JSON(http.StatusBadGateway, gin.H{
 			"error": gin.H{"code": "agent_error", "message": err.Error()},

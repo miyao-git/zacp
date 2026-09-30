@@ -1,8 +1,9 @@
 <script setup lang="ts">
-import { ref } from 'vue'
+import { onMounted, ref } from 'vue'
 import { useDialog, useMessage } from 'naive-ui'
 import { useI18n } from 'vue-i18n'
 import { LogoGithub } from '@vicons/ionicons5'
+import { fetchVersion } from '@/api'
 import pkg from '../../../package.json'
 
 const { t } = useI18n()
@@ -14,6 +15,24 @@ const dialog = useDialog()
  * 不依赖后端 /api/v1/version——dev 模式下后端返回 "dev"，会导致显示 "vdev"。
  */
 const appVersion = pkg.version
+
+/**
+ * build 号（后端构建时注入的 git 短提交号）：只有编译进二进制的后端知道，
+ * 因此这一项必须问后端，与上面「版本号取自 package.json」并不矛盾。
+ * dev 模式下后端返回 "unknown"（未注入），此时不显示后缀，避免出现 "v0.9.0 (unknown)"。
+ */
+const buildCommit = ref('')
+
+onMounted(async () => {
+  try {
+    const info = await fetchVersion()
+    if (info.commit && info.commit !== 'unknown') {
+      buildCommit.value = info.commit
+    }
+  } catch {
+    // 取不到就只显示版本号：build 号是辅助信息，不该让关于页报错
+  }
+})
 
 /** 外链地址：项目主页与作者 X（新窗口打开，noopener 防反向劫持） */
 const GITHUB_URL = 'https://github.com/helloxz/zacp'
@@ -204,6 +223,11 @@ async function checkForUpdate() {
         class="inline-flex items-center gap-1.5 rounded-full bg-surface-hover px-3 py-1 text-xs font-medium text-ink-muted"
       >
         {{ t('settings.about.version') }} v{{ appVersion }}
+        <!-- build 号（git 短提交）：dev 下后端未注入则整段不渲染 -->
+        <span
+          v-if="buildCommit"
+          class="font-mono font-normal opacity-70"
+        >({{ buildCommit }})</span>
       </span>
       <n-button
         size="tiny"

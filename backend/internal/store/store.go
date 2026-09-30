@@ -166,6 +166,11 @@ func runMigrations(db *gorm.DB) error {
 			Name:    "workspace_sort_order",
 			Func:    migrateV7,
 		},
+		{
+			Version: 8,
+			Name:    "messages_agent_message_id",
+			Func:    migrateV8,
+		},
 	}
 
 	// 执行未应用的迁移

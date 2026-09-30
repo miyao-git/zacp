@@ -2,7 +2,7 @@
 import { computed, h, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import type { VNodeChild } from 'vue'
 import { useI18n } from 'vue-i18n'
-import { AddOutline, CreateOutline, OptionsOutline, Stop } from '@vicons/ionicons5'
+import { AddOutline, ArrowUndoOutline, CreateOutline, OptionsOutline, Stop } from '@vicons/ionicons5'
 import { NIcon, useMessage } from 'naive-ui'
 import type { InputInst, SelectGroupOption, SelectOption } from 'naive-ui'
 import { useSessionStore, MAX_TURNS_PER_SESSION, type SessionStreamStatus } from '@/stores/session'
@@ -372,6 +372,28 @@ function onEditSteer(id: number) {
 }
 
 // ---------------------------------------------------------------------------
+// 回退重发（编辑历史消息）：store 挂上 rewindTarget 后把原文填进输入框并聚焦，
+// 输入卡上方显示可撤销的提示条；发送时由 store 先发 rewind 帧、收到 rewind.done
+// 再发 prompt（见 stores/session.ts 的「会话回退」段）。
+// ---------------------------------------------------------------------------
+
+/** 当前会话的回退目标；切到别的会话时不显示（目标带 sessionId，发送时同样校验） */
+const rewindTarget = computed(() => {
+  const target = sessionStore.rewindTarget
+  return target && target.sessionId === sessionStore.currentId ? target : null
+})
+
+watch(rewindTarget, (target) => {
+  if (!target) {
+    return
+  }
+  // 覆盖而非追加：点历史消息的「编辑」语义就是「改这条再重发」，输入框此刻的内容
+  // 视为放弃（与排队条的编辑不同——那里用户可能正在写新内容，所以是追加）。
+  text.value = target.text
+  focusInputAtEnd()
+})
+
+// ---------------------------------------------------------------------------
 // / 命令候选面板（数据来自 agent 经 ACP available_commands_update 通告的命令列表）
 // ---------------------------------------------------------------------------
 
@@ -576,6 +598,26 @@ function onKeydown(e: KeyboardEvent) {
 <template>
   <!-- 外层只做「输入框 + 上方叠放排队卡片」的容器；输入卡片本身保持原有结构 -->
   <div class="relative w-full">
+    <!-- 回退提示条：编辑历史消息后，发送前会先把会话回退到那条消息之前（对话与文件
+         检查点一并回退），这里把这一副作用说明白并给撤销入口。
+         与 steer 叠层天然互斥：回退要求会话空闲，排队条只在有轮次在跑时出现。 -->
+    <div
+      v-if="rewindTarget"
+      class="mb-1.5 flex w-full items-center gap-1.5 rounded-xl border border-amber-200 bg-amber-50 px-3 py-1.5 text-xs text-amber-800 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-200"
+    >
+      <n-icon :size="13" class="shrink-0"><ArrowUndoOutline /></n-icon>
+      <span class="min-w-0 flex-1 truncate" :title="rewindTarget.text">
+        {{ t('chat.rewindHint') }}
+      </span>
+      <button
+        type="button"
+        class="shrink-0 cursor-pointer rounded px-1.5 py-0.5 transition-colors hover:bg-amber-200/60 dark:hover:bg-amber-500/20"
+        @click="sessionStore.clearRewindTarget()"
+      >
+        {{ t('common.cancel') }}
+      </button>
+    </div>
+
     <!-- steer 排队条（扑克牌叠放）：位于输入框上方，输入框是最前一张（完整可见、在最下）；
          每条 steer 逐层向上错位，被更靠前的一张压住下半部分（只露上边一行文本，
          顶对齐所以文字完整可读），最早发出的排在最上层（最后一层）；每张右侧都有
@@ -747,10 +789,11 @@ function onKeydown(e: KeyboardEvent) {
       </div>
 
       <div class="flex shrink-0 items-center gap-2">
-        <!-- 当轮持续时间（m:ss）：turn 进行中显示在停止按钮左侧 -->
+        <!-- 当轮持续时间（m:ss）：turn 进行中显示在停止按钮左侧。
+             mr-2 在容器 gap-2 之外再拉开一档：计时数字紧贴红色圆按钮时两者容易糊成一块 -->
         <span
           v-if="status !== 'idle' && elapsedText"
-          class="text-xs tabular-nums text-ink-muted"
+          class="mr-2 text-xs tabular-nums text-ink-muted"
         >
           {{ elapsedText }}
         </span>

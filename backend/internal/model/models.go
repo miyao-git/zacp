@@ -3,6 +3,7 @@
 package model
 
 import (
+	"encoding/json"
 	"time"
 
 	"gorm.io/gorm"
@@ -65,6 +66,31 @@ type Session struct {
 // TableName 指定表名。
 func (Session) TableName() string { return "sessions" }
 
+// RewindCommandName 是 agent 通告的会话回退命令名（qodercli 的 /rewind）。
+const RewindCommandName = "rewind"
+
+// SupportsRewind 判断该会话能否回退：以 agent 自己经 available_commands_update
+// 通告的命令列表为准（qodercli 含 rewind），不按 agent id 硬编码——
+// 将来别的 agent 支持了也自动生效。
+//
+// 背景：ACP 协议没有 rewind 方法，qodercli 只在 ACP 模式下放行了
+// `/rewind <message-id>` 这一条斜杠命令，因此「是否支持」完全取决于 agent 是否通告它。
+func (s *Session) SupportsRewind() bool {
+	if s == nil || s.AvailableCommands == "" {
+		return false
+	}
+	var cmds []AvailableCommandDTO
+	if err := json.Unmarshal([]byte(s.AvailableCommands), &cmds); err != nil {
+		return false
+	}
+	for _, c := range cmds {
+		if c.Name == RewindCommandName {
+			return true
+		}
+	}
+	return false
+}
+
 // SessionStatus 会话状态。
 type SessionStatus string
 
@@ -83,8 +109,13 @@ type Message struct {
 	Events    string `gorm:"type:text" json:"events"`         // 完整事件 JSON（工具调用等；自 v6 起剥离 input/output，见 ToolDetails）
 	// ToolDetails 工具调用详情 JSON（toolId → {input, output}），与 events 同步写入：
 	// events 落库时已剥离 input/output，展开工具卡详情从本列读取（列表瘦身 ~90%）。
-	ToolDetails string    `gorm:"type:text" json:"toolDetails"`
-	CreatedAt   time.Time `json:"createdAt"`
+	ToolDetails string `gorm:"type:text" json:"toolDetails"`
+	// AgentMessageID agent 侧的消息 id（ACP PromptRequest.messageId / PromptResponse.userMessageId，
+	// 协议要求 UUID 格式）。qodercli 会把它当作会话文件里的消息 uuid，因此它是
+	// `/rewind <message-id>` 唯一的锚点。仅 user 消息需要。
+	// 为空 = 拿不到锚点（非 qoder agent、或本字段引入前的历史消息且回填未匹配上），不可回退。
+	AgentMessageID string    `gorm:"column:agent_message_id" json:"agentMessageId"`
+	CreatedAt      time.Time `json:"createdAt"`
 
 	// 关联
 	Session Session `gorm:"foreignKey:SessionID" json:"session,omitempty"`

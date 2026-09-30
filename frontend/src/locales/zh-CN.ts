@@ -112,6 +112,9 @@ export default {
     // steer 排队条（响应过程中发送的消息：本轮结束后自动发出，可编辑取回）
     steerEdit: '编辑这条排队消息',
     steerSendHint: '排队发送：本轮回复结束后自动发出',
+    // 会话回退（编辑历史消息后重发：先把对话与文件回退到该消息之前）
+    rewindEdit: '编辑',
+    rewindHint: '发送前会回退到这条消息之前（对话与文件改动一并撤销）',
     placeholder: '给 Agent 发送消息…',
     enterHint: 'Enter 发送 · Shift+Enter 换行',
     send: '发送',

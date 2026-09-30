@@ -1992,9 +1992,30 @@ export const useSessionStore = defineStore('session', () => {
           }
           break
         }
+        case 'rewind.done': {
+          // 回退成功：先裁剪本地历史，再结算等待中的发送流程（顺序不能反——
+          // 结算后 sendViaWs 会立刻乐观追加新用户消息，裁剪必须发生在它之前）。
+          // sid 解析失败时仍要结算，否则发送方一直挂到超时。
+          const deletedFrom = msg.deletedFromMessageId ?? 0
+          if (sid !== null && deletedFrom > 0) {
+            dropMessagesFrom(sid, deletedFrom)
+          }
+          settlePendingRewind()
+          break
+        }
         case 'error': {
           // 出错同样结束本轮；错误只写入目标 session，避免后台错误串到当前窗口。
           const target = sid ?? fallbackRunningSid()
+          // 回退在途时收到的 error 优先结算回退（后端回退失败走 REWIND_ERROR，
+          // 此时并没有轮次在跑，endStreamTurn 对 idle 会话是空操作）
+          if (msg.code === 'REWIND_ERROR') {
+            settlePendingRewind(new Error(msg.message ?? msg.code ?? 'rewind failed'))
+            if (target !== null) {
+              setSessionStreamError(target, msg.message ?? msg.code ?? 'rewind failed')
+            }
+            break
+          }
+          settlePendingRewind(new Error(msg.message ?? msg.code ?? 'unknown error'))
           if (target !== null) {
             endStreamTurn(target)
             setSessionStreamError(target, msg.message ?? msg.code ?? 'unknown error')
@@ -2090,6 +2111,135 @@ export const useSessionStore = defineStore('session', () => {
     })
   }
 
+  // ---------------------------------------------------------------------------
+  // 会话回退（rewind）：编辑历史消息后重发
+  //
+  // 交互：点历史用户消息的「编辑」→ 正文进输入框并挂上回退目标（Composer 上方的
+  // 提示条，可撤销）→ 回车发送时先发 rewind 帧，收到 rewind.done 后丢掉被回退的
+  // 本地消息，再走正常 prompt 发出改后的文本。
+  //
+  // 为什么分两帧而不是一条「回退并发送」：回退要等 agent 确认成功才能删本地历史，
+  // 否则 agent 拒绝时（会话非空闲、锚点失效等）消息已经没了、上下文却还在，
+  // 两侧永久不一致。能力上只有 qoder 系 agent 支持（ACP 无 rewind 方法，
+  // qodercli 单独放行了 `/rewind <message-id>`），因此以消息是否带 agentMessageId
+  // 作为「可回退」的判据，不另设 agent 白名单。
+  // ---------------------------------------------------------------------------
+
+  /** 回退在途等待超时：agent 侧回退是本地操作（实测约 100ms），30s 足够覆盖冷启动 */
+  const REWIND_TIMEOUT_MS = 30_000
+
+  /**
+   * 待回退目标（null = 普通发送）。带 sessionId：切换会话后残留的目标不会被
+   * 误用到别的会话上（发送时按 sessionId 校验，提示条也只对当前会话显示）。
+   * text 是被编辑消息的原文，Composer 据此填充输入框并在提示条里回显。
+   */
+  const rewindTarget = ref<{ sessionId: number; messageId: number; text: string } | null>(null)
+
+  /** 回退在途请求：等待后端 rewind.done / error（一次只允许一个） */
+  let pendingRewind:
+    | { resolve: () => void; reject: (err: Error) => void; timer: ReturnType<typeof setTimeout> }
+    | null = null
+
+  /**
+   * 该消息是否可回退（决定历史消息上是否显示编辑按钮）。
+   * 只认已落库（id > 0）且带 agent 侧锚点的用户消息；会话有轮次在跑时不显示——
+   * agent 要求回退时必须空闲，此时点了也只会被拒绝。
+   */
+  function canRewindMessage(msg: ChatMessage): boolean {
+    return (
+      msg.role === 'user' &&
+      msg.id > 0 &&
+      !!msg.agentMessageId &&
+      statusOf(msg.sessionId) === 'idle'
+    )
+  }
+
+  /** 挂上回退目标（点历史消息的「编辑」时调用） */
+  function setRewindTarget(msg: ChatMessage) {
+    rewindTarget.value = {
+      sessionId: msg.sessionId,
+      messageId: msg.id,
+      text: msg.content,
+    }
+  }
+
+  /** 撤销回退目标（点提示条的取消、发送完成、切换会话） */
+  function clearRewindTarget() {
+    rewindTarget.value = null
+  }
+
+  /**
+   * 发送 rewind 帧并等待后端确认。resolve 表示 agent 已回退成功、本地历史已由
+   * rewind.done 处理器裁剪；reject 时本地消息保持原样（两侧仍一致）。
+   * acpSessionId 由调用方保证非空（发送前的守卫已校验）。
+   */
+  function performRewind(acpSessionId: string, agentId: string, messageId: number): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      const fail = (err: Error) => {
+        clearTimeout(timer)
+        pendingRewind = null
+        reject(err)
+      }
+      const timer = setTimeout(
+        () => fail(new Error('rewind timed out')),
+        REWIND_TIMEOUT_MS,
+      )
+      pendingRewind = { resolve, reject: fail, timer }
+      const sent = acpSocket.send({
+        type: 'rewind',
+        sessionId: acpSessionId,
+        agentId,
+        targetMessageId: messageId,
+      })
+      if (!sent) {
+        fail(new Error('websocket not connected'))
+      }
+    })
+  }
+
+  /** 回退在途请求收尾（rewind.done / error 共用），返回是否有请求被结算 */
+  function settlePendingRewind(err?: Error) {
+    const pending = pendingRewind
+    if (!pending) {
+      return false
+    }
+    pendingRewind = null
+    clearTimeout(pending.timer)
+    if (err) {
+      pending.reject(err)
+    } else {
+      pending.resolve()
+    }
+    return true
+  }
+
+  /**
+   * 丢掉被回退的本地消息：id >= deletedFrom 的全部移除（含流式占位——其 id 为负，
+   * 属于本轮产物，回退后同样不该留着），并清空会话级流式槽位。
+   * 与后端 DeleteFromID 同一口径：qodercli 的语义是「回退到该消息之前」，
+   * 目标消息本身连同其后所有轮次都不再存在于当前分支上。
+   */
+  function dropMessagesFrom(sessionId: number, deletedFrom: number) {
+    const list = messagesById.value[sessionId]
+    if (list) {
+      // 必须按「真实 DB id」比较，不能用 m.id：转正占位为了稳定 v-for key 仍保留
+      // 负 id（真实 id 记在 finalizedDbIdBySession，见 persistedIdOf），直接比 m.id
+      // 会把它们一律判成 < deletedFrom 而留下，该消失的轮次继续显示在列表里。
+      // persistedIdOf 返回 undefined = 未转正的本轮占位，回退后必然作废，一并丢弃。
+      messagesById.value[sessionId] = list.filter((m) => {
+        const dbId = persistedIdOf(m)
+        return dbId !== undefined && dbId < deletedFrom
+      })
+    }
+    freezeStreamBlocks(sessionId)
+    delete streamMsgIdBySession.value[sessionId]
+    delete streamUserIdBySession.value[sessionId]
+    streamBlocksBySession.value[sessionId] = []
+    streamReasoningBySession.value[sessionId] = ''
+    activeToolCardsBySession.value[sessionId] = []
+    activePlanBySession.value[sessionId] = null
+  }
+
   /**
    * 解析 `/rename <title>` 命令：返回标题（trim 后非空、单行）；非该命令返回 null。
    * 要求 `/rename` 后紧跟空白（避免 `/renamefoo` 误判），标题不含换行。
@@ -2164,6 +2314,22 @@ export const useSessionStore = defineStore('session', () => {
     markInitialSessionDetailRefresh(session)
     if (!session.acpSessionId) {
       throw new Error('session has no acp session id')
+    }
+
+    // 编辑历史消息后重发：先把会话回退到该消息之前，再走下面的正常发送流程。
+    // 目标带 sessionId 校验，避免切换会话后把回退打到别的会话上。
+    // 失败直接抛出（不发消息、不动本地历史），两侧保持一致。
+    const target = rewindTarget.value
+    if (target && target.sessionId === sessionId) {
+      clearRewindTarget()
+      try {
+        await performRewind(session.acpSessionId, session.agentId, target.messageId)
+      } catch (e) {
+        // 回退失败：把目标还回去。否则用户改完重试会变成「不回退直接发送」——
+        // 消息追加在旧上下文后面，与「编辑重发」的语义完全不同，且没有任何提示。
+        rewindTarget.value = target
+        throw e
+      }
     }
 
     // 新一轮开始：先冻结上一轮尚未转正的占位内容，再清空会话级流式槽位，
@@ -2330,6 +2496,11 @@ export const useSessionStore = defineStore('session', () => {
     isStreamingMessage,
     persistedIdOf,
     runningSessionIds,
+    // 会话回退（编辑历史消息后重发）
+    rewindTarget,
+    canRewindMessage,
+    setRewindTarget,
+    clearRewindTarget,
     streamError,
     streamErrorOf,
     setSessionStreamError,

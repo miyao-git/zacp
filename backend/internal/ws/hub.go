@@ -237,6 +237,28 @@ func (c *Client) handleMessage(ctx context.Context, msg ClientMessage) {
 			}()
 		}
 
+	case MsgTypeRewind:
+		// 回退到某条用户消息之前（前端「编辑历史消息后重发」的第一步）。
+		// 与 prompt 同一口径订阅会话，保证 rewind.done 能投递回本连接；
+		// 失败走 error 帧（带 sessionId，前端按会话路由提示并保留本地消息）。
+		c.hub.log.Info("received rewind", "sessionID", msg.SessionID, "target", msg.TargetMessageID)
+		if msg.SessionID != "" {
+			c.SubscribeSession(msg.SessionID, msg.AgentID)
+		}
+		if bridge != nil && msg.TargetMessageID > 0 {
+			go func() {
+				if err := bridge.HandleRewind(ctx, msg.SessionID, msg.AgentID, msg.TargetMessageID); err != nil {
+					c.hub.log.Error("handle rewind error", "error", err)
+					c.Send(ServerMessage{
+						Type:      MsgTypeError,
+						SessionID: msg.SessionID,
+						Code:      "REWIND_ERROR",
+						Message:   err.Error(),
+					})
+				}
+			}()
+		}
+
 	case MsgTypePermission:
 		c.hub.log.Info("received permission", "permissionID", msg.PermissionID, "optionID", msg.OptionID)
 		if bridge != nil && msg.PermissionID != "" && msg.OptionID != "" {

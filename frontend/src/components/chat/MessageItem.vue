@@ -2,12 +2,15 @@
 import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { IncremarkContent } from '@incremark/vue'
+import { CreateOutline } from '@vicons/ionicons5'
+import { NIcon } from 'naive-ui'
 import { fetchMessageThoughts } from '@/api'
 import type { ChatMessage, ToolDetailsMap } from '@/types/models'
 import type { WsEvent } from '@/types/ws'
 import type { ToolCard } from '@/stores/session'
 import { useSessionStore } from '@/stores/session'
 import { type MessageBlock } from '@/composables/useMessageBlocks'
+import { formatMessageTime } from '@/utils/relativeTime'
 import ToolCallCard from '@/components/chat/ToolCallCard.vue'
 
 const props = defineProps<{ message: ChatMessage }>()
@@ -33,6 +36,12 @@ const reasoningLoadState = ref<'idle' | 'loading' | 'loaded'>('idle')
 
 /** user 右对齐 / assistant 左对齐（角色用样式区分，不用气泡色做语义） */
 const isUser = computed(() => props.message.role === 'user')
+
+/** 发送时刻（气泡下方页脚）；流式占位消息的 createdAt 是本地时间，同样成立 */
+const sentAt = computed(() => formatMessageTime(props.message.createdAt))
+
+/** 是否可回退重发（决定编辑按钮是否出现，判据见 store.canRewindMessage） */
+const canRewind = computed(() => sessionStore.canRewindMessage(props.message))
 
 /**
  * 是否存在思考过程（决定折叠面板是否展示）：
@@ -306,7 +315,7 @@ const visibleBlocks = computed<MessageBlock[]>(() =>
 <template>
   <!-- data-msg-* 供 MessageList 的消息导航条按 id 定位滚动锚点（DOM 顺序即时间顺序） -->
   <div
-    class="flex flex-col gap-2"
+    class="group flex flex-col gap-2"
     :class="isUser ? 'items-end' : 'items-start'"
     :data-msg-id="message.id"
     :data-msg-role="message.role"
@@ -317,6 +326,26 @@ const visibleBlocks = computed<MessageBlock[]>(() =>
       class="max-w-[85%] min-w-0 wrap-anywhere break-words whitespace-pre-wrap [overflow-wrap:anywhere] rounded-2xl rounded-br-md bg-sky-50 px-3.5 py-2.5 text-sm leading-relaxed text-slate-900 ring-1 ring-inset ring-sky-100 dark:bg-sky-500/15 dark:text-sky-50 dark:ring-sky-500/30"
     >
       {{ message.content }}
+    </div>
+
+    <!-- 用户消息页脚：编辑（回退重发）+ 发送时刻。
+         编辑按钮仅在可回退时出现（见 canRewindMessage）：消息必须已落库、拿到 agent 侧
+         锚点、且会话空闲——agent 要求回退时无执行中/排队的轮次。
+         hover 显示、触屏常显（pointer-coarse），与侧栏条目的操作按钮同一套口径。 -->
+    <div
+      v-if="isUser"
+      class="-mt-1 flex items-center gap-1 pr-1 text-xs leading-4 text-ink-muted"
+    >
+      <button
+        v-if="canRewind"
+        type="button"
+        class="flex cursor-pointer items-center rounded p-1 opacity-0 transition-opacity group-hover:opacity-100 hover:bg-surface-hover hover:text-ink-secondary focus:outline-none focus-visible:opacity-100 focus-visible:ring-2 focus-visible:ring-primary/50 pointer-coarse:opacity-100"
+        :aria-label="t('chat.rewindEdit')"
+        @click="sessionStore.setRewindTarget(message)"
+      >
+        <n-icon :size="14"><CreateOutline /></n-icon>
+      </button>
+      <span v-if="sentAt" class="tabular-nums">{{ sentAt }}</span>
     </div>
 
     <!-- 消息块时间线：按事件顺序交错渲染 AI 文本与工具调用，

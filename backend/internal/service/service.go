@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	acpclient "github.com/helloxz/zacp/internal/acp/client"
 	"github.com/helloxz/zacp/internal/acp/manager"
 	"github.com/helloxz/zacp/internal/acp/providers"
@@ -544,18 +545,24 @@ func (s *SessionService) SendMessage(ctx context.Context, sessionID uint, conten
 	}
 
 	// 保存用户消息
+	// agentMessageID 由 zacp 发号（ACP 允许客户端指定 messageId，协议要求 UUID 格式）：
+	// qodercli 会采纳它作为会话文件里的消息 uuid，事后即可用 `/rewind <id>` 精确回退到
+	// 这条消息之前。turn 结束后再以 agent 回传的 userMessageId 为准校正（见下方）。
+	agentMessageID := uuid.NewString()
 	userMsg := &model.Message{
-		SessionID: sessionID,
-		Role:      "user",
-		Content:   content,
-		CreatedAt: time.Now(),
+		SessionID:      sessionID,
+		Role:           "user",
+		Content:        content,
+		AgentMessageID: agentMessageID,
+		CreatedAt:      time.Now(),
 	}
 	if err := s.msgRepo.Create(userMsg); err != nil {
 		return nil, fmt.Errorf("failed to save user message: %w", err)
 	}
 
 	// 发送到 ACP
-	response, err := s.mgr.Prompt(ctx, session.AgentID, session.ACPSessionID, content)
+	opts := manager.PromptOptions{MessageID: agentMessageID}
+	response, err := s.mgr.Prompt(ctx, session.AgentID, session.ACPSessionID, content, opts)
 	if err != nil {
 		if manager.IsUnknownSessionErr(err) {
 			// agent 侧会话已失效（后端/agent 重启后 acp_session_id 在 agent 内存中丢失，
@@ -564,12 +571,20 @@ func (s *SessionService) SendMessage(ctx context.Context, sessionID uint, conten
 			if recErr := s.recoverACPSession(ctx, session); recErr != nil {
 				return nil, fmt.Errorf("session %s lost on agent, recover failed: %w", session.ACPSessionID, recErr)
 			}
-			response, err = s.mgr.Prompt(ctx, session.AgentID, session.ACPSessionID, content)
+			response, err = s.mgr.Prompt(ctx, session.AgentID, session.ACPSessionID, content, opts)
 			if err != nil {
 				return nil, fmt.Errorf("failed to send to agent: %w", err)
 			}
 		} else {
 			return nil, fmt.Errorf("failed to send to agent: %w", err)
+		}
+	}
+
+	// agent 回传的 id 才是权威值：不采纳客户端 messageId 的 agent 会自行分配，
+	// 此时按回传值改写，否则存下来的锚点指向不存在的消息，rewind 必然失败。
+	if response.UserMessageID != "" && response.UserMessageID != agentMessageID {
+		if err := s.msgRepo.UpdateAgentMessageID(userMsg.ID, response.UserMessageID); err != nil {
+			slog.Warn("update agent message id failed", "messageID", userMsg.ID, "err", err)
 		}
 	}
 
@@ -609,6 +624,8 @@ func (s *SessionService) GetMessages(sessionID uint, limit, offset int) ([]model
 	if err != nil {
 		return nil, err
 	}
+	// 补齐 rewind 锚点（best-effort，只在窗口内确有缺失时才读 agent 会话文件）
+	s.EnsureAgentMessageIDs(sessionID, messages)
 	stripThoughtText(messages)
 	return messages, nil
 }

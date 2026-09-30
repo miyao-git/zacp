@@ -287,6 +287,13 @@ export interface ChatMessage {
    */
   streamFinalized?: boolean
 
+  /**
+   * agent 侧的消息 id（UUID），`/rewind <message-id>` 的锚点。
+   * 仅 user 消息有值；为空表示拿不到锚点（非 qoder agent、或早于该字段引入且
+   * 磁盘回填没对齐上），此时不显示编辑/回退入口。
+   */
+  agentMessageId?: string
+
   createdAt: string
 }
 

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	acp "github.com/coder/acp-go-sdk"
+	"github.com/google/uuid"
 
 	"github.com/helloxz/zacp/internal/acp/client"
 	"github.com/helloxz/zacp/internal/acp/manager"
@@ -47,9 +48,11 @@ type EventBridge struct {
 }
 
 // queuedPrompt 排队等待执行的用户消息。
-// 用户消息在入队前就已落库（立即进入对话序列），队列里只保留执行所需文本。
+// 用户消息在入队前就已落库（立即进入对话序列），队列里只保留执行所需文本
+// 与落库时发号的 ACP messageId（执行时原样带上，见 handlePrompt）。
 type queuedPrompt struct {
-	text string
+	text           string
+	agentMessageID string
 }
 
 // pendingPermission 一个等待前端回传的权限请求。
@@ -118,19 +121,23 @@ func (b *EventBridge) HasPromptInProgress(agentID, sessionID string) bool {
 	return b.activeTurns[key] || len(b.promptQueues[key]) > 0
 }
 
+// hasTurnLocked 判定该会话是否已有轮次在执行或排队（调用方须持有 promptQueueMu）。
+func (b *EventBridge) hasTurnLocked(key string) bool {
+	return b.activeTurns[key] || len(b.promptQueues[key]) > 0
+}
+
 // acquireTurnOrEnqueue 原子判定该会话当前是否可以立刻执行一轮 prompt：
 //   - 空闲（无执行中的轮次、无排队消息）→ 登记占用并返回 run=true；
 //   - 繁忙（本会话已有 turn 在执行或排队，或 manager 层有其它入口的 turn）→
 //     消息入队等待接力执行，返回 run=false。
 //
 // 判定与登记在同一临界区内完成，避免「检查通过后、登记前」被其它帧插队。
-func (b *EventBridge) acquireTurnOrEnqueue(agentID, sessionID, text string) (run bool) {
+func (b *EventBridge) acquireTurnOrEnqueue(agentID, sessionID, text, agentMessageID string) (run bool) {
 	key := promptQueueKey(agentID, sessionID)
 	b.promptQueueMu.Lock()
 	defer b.promptQueueMu.Unlock()
-	if b.activeTurns[key] || len(b.promptQueues[key]) > 0 ||
-		b.manager.HasPromptInProgress(agentID, sessionID) {
-		b.promptQueues[key] = append(b.promptQueues[key], &queuedPrompt{text: text})
+	if b.hasTurnLocked(key) || b.manager.HasPromptInProgress(agentID, sessionID) {
+		b.promptQueues[key] = append(b.promptQueues[key], &queuedPrompt{text: text, agentMessageID: agentMessageID})
 		return false
 	}
 	b.activeTurns[key] = true
@@ -187,19 +194,19 @@ func (b *EventBridge) chainNextQueued(agentID, sessionID string) {
 		return
 	}
 	b.log.Info("running queued prompt", "sessionID", sessionID, "remaining", b.queuedCount(agentID, sessionID))
-	go b.runQueuedTurn(agentID, sessionID, next.text)
+	go b.runQueuedTurn(agentID, sessionID, next.text, next.agentMessageID)
 }
 
 // runQueuedTurn 执行一条排队消息：用户消息在入队时已落库，这里只跑 agent 轮次。
 // 用独立 ctx：浏览器断线/离开页面不应中断用户已明确排队的后续轮次。
-func (b *EventBridge) runQueuedTurn(agentID, sessionID, text string) {
+func (b *EventBridge) runQueuedTurn(agentID, sessionID, text, agentMessageID string) {
 	dbSession, err := b.sessionRepo.GetByACPSessionID(sessionID)
 	if err != nil {
 		b.log.Error("queued prompt: session not found", "sessionID", sessionID, "err", err)
 		b.chainNextQueued(agentID, sessionID)
 		return
 	}
-	if err := b.runTurn(context.Background(), dbSession, agentID, sessionID, text, nil, nil); err != nil {
+	if err := b.runTurn(context.Background(), dbSession, agentID, sessionID, text, agentMessageID, nil, nil); err != nil {
 		b.log.Error("queued prompt failed", "sessionID", sessionID, "err", err)
 		// 与 WS 入口同一口径：广播 error 让前端复位状态并提示原因
 		b.handler.BroadcastError(sessionID, "PROMPT_ERROR", err.Error())
@@ -754,11 +761,16 @@ func (b *EventBridge) handlePrompt(ctx context.Context, sessionID, agentID, mess
 	}
 
 	// 落库用户消息（即使 agent 调用失败也保留）
+	// agentMessageID 由 zacp 发号（ACP 允许客户端指定 messageId，协议要求 UUID 格式）：
+	// qodercli 会采纳它作为会话文件里的消息 uuid，事后即可用 `/rewind <id>` 精确回退到
+	// 这条消息之前；turn 结束后再以 agent 回传的 userMessageId 为准校正（见 runTurn）。
+	agentMessageID := uuid.NewString()
 	userMsg := &model.Message{
-		SessionID: dbSession.ID,
-		Role:      "user",
-		Content:   message,
-		CreatedAt: time.Now(),
+		SessionID:      dbSession.ID,
+		Role:           "user",
+		Content:        message,
+		AgentMessageID: agentMessageID,
+		CreatedAt:      time.Now(),
 	}
 	if err := b.msgRepo.Create(userMsg); err != nil {
 		return fmt.Errorf("failed to save user message: %w", err)
@@ -782,18 +794,19 @@ func (b *EventBridge) handlePrompt(ctx context.Context, sessionID, agentID, mess
 	// 该会话已有 turn 在执行/排队（「响应过程中继续发消息」）：用户消息已落库
 	// 进入对话序列，这里入队等待本轮结束后自动接力执行，立即返回不阻塞 WS 帧；
 	// 前端在排队消息被真正执行时收到下一轮的 turn.started/事件流。
-	if !b.acquireTurnOrEnqueue(agentID, sessionID, message) {
+	if !b.acquireTurnOrEnqueue(agentID, sessionID, message, agentMessageID) {
 		b.log.Info("prompt queued behind running turn",
 			"sessionID", sessionID, "queued", b.queuedCount(agentID, sessionID))
 		return nil
 	}
-	return b.runTurn(ctx, dbSession, agentID, sessionID, message, wait, release)
+	return b.runTurn(ctx, dbSession, agentID, sessionID, message, agentMessageID, wait, release)
 }
 
 // runTurn 执行一轮 prompt（用户消息已落库，调用方完成草稿转正/标题处理）。
+// agentMessageID 是落库时为该用户消息发号的 ACP messageId（见 handlePrompt）。
 // 收尾（成功、取消、出错都算）无条件释放会话占用并接力下一条排队消息，
 // 否则该会话的队列会在异常路径上永久卡住。
-func (b *EventBridge) runTurn(ctx context.Context, dbSession *model.Session, agentID, sessionID, message string, wait <-chan struct{}, release func()) error {
+func (b *EventBridge) runTurn(ctx context.Context, dbSession *model.Session, agentID, sessionID, message, agentMessageID string, wait <-chan struct{}, release func()) error {
 	defer b.chainNextQueued(agentID, sessionID)
 
 	if wait != nil {
@@ -803,7 +816,8 @@ func (b *EventBridge) runTurn(ctx context.Context, dbSession *model.Session, age
 			return ctx.Err()
 		}
 	}
-	result, err := b.manager.PromptWithAdmission(ctx, agentID, sessionID, message, release)
+	opts := manager.PromptOptions{MessageID: agentMessageID}
+	result, err := b.manager.PromptWithAdmission(ctx, agentID, sessionID, message, release, opts)
 	if err != nil && manager.IsUnknownSessionErr(err) {
 		// ACP session 失效（服务端/agent 重启后 DB 记录仍在、agent 端已丢失）：
 		// 自动恢复并重试一次，前端无感知。事件回调由 onStarted 钩子注册，
@@ -811,7 +825,7 @@ func (b *EventBridge) runTurn(ctx context.Context, dbSession *model.Session, age
 		b.log.Warn("acp session invalid, recovering", "sessionID", sessionID, "err", err)
 		if newID, ok := b.recoverSession(ctx, dbSession, agentID, sessionID); ok {
 			sessionID = newID
-			result, err = b.manager.PromptWithAdmission(ctx, agentID, sessionID, message, release)
+			result, err = b.manager.PromptWithAdmission(ctx, agentID, sessionID, message, release, opts)
 		}
 	}
 	if err != nil {
@@ -824,6 +838,14 @@ func (b *EventBridge) runTurn(ctx context.Context, dbSession *model.Session, age
 			return nil
 		}
 		return err
+	}
+
+	// agent 回传的 id 才是权威值：不采纳客户端 messageId 的 agent 会自行分配，
+	// 此时按回传值改写，否则存下来的 rewind 锚点指向不存在的消息。
+	if result.UserMessageID != "" {
+		if err := b.msgRepo.CorrectAgentMessageID(dbSession.ID, agentMessageID, result.UserMessageID); err != nil {
+			b.log.Warn("correct agent message id failed", "sessionID", sessionID, "err", err)
+		}
 	}
 
 	// 落库助手回复：events 拆分为「瘦身事件 + 工具详情」两列落库，
@@ -863,6 +885,83 @@ func (b *EventBridge) HandleCancel(ctx context.Context, sessionID, agentID strin
 		return err
 	}
 	return b.manager.Cancel(ctx, agentID, sessionID)
+}
+
+// HandleRewind 处理 WebSocket 的 rewind 帧：把会话回退到指定用户消息**之前**。
+//
+// 实现要点（每一条都是踩过的坑或 agent 侧的硬约束）：
+//   - ACP 协议没有 rewind 方法：实际由 manager.Rewind 以「静默指令轮」发送
+//     `/rewind <agent-message-id>`。qodercli 在 ACP 模式下专门放行了这条命令
+//     （本地执行、约 100ms、不调模型），对话分支与文件检查点一并回退；
+//   - 必须空闲：agent 侧要求回退时无执行中/排队的 prompt，这里先自查并给出
+//     明确错误，而不是把 agent 的英文拒绝文案原样抛给用户；
+//   - 目标不能是首条用户消息：qodercli 回退到首条之前会把 active-leaf 置为 null，
+//     之后 session/load 报 Invalid session identifier（该会话再也 load 不回来）。
+//     那是「清空对话」的语义，不该由回退入口触发；
+//   - 先让 agent 回退、成功后才截断本地历史：顺序反了的话，agent 拒绝时本地消息
+//     已经删掉，两侧永久不一致（用户看到消息没了但对话上下文还在）。
+func (b *EventBridge) HandleRewind(ctx context.Context, sessionID, agentID string, targetMessageID uint) error {
+	dbSession, err := b.sessionRepo.GetByACPSessionID(sessionID)
+	if err != nil {
+		return fmt.Errorf("session not found: %w", err)
+	}
+	if !dbSession.SupportsRewind() {
+		return fmt.Errorf("agent %q 不支持会话回退", dbSession.AgentID)
+	}
+	target, err := b.msgRepo.GetBySessionAndID(dbSession.ID, targetMessageID)
+	if err != nil {
+		return fmt.Errorf("回退目标消息不存在: %w", err)
+	}
+	if target.Role != "user" {
+		return fmt.Errorf("只能回退到用户消息之前")
+	}
+	if target.AgentMessageID == "" {
+		return fmt.Errorf("该消息缺少 agent 侧锚点，无法回退")
+	}
+	if first, err := b.msgRepo.FirstUserMessage(dbSession.ID); err == nil && first != nil && first.ID == target.ID {
+		return fmt.Errorf("不能回退掉首条消息（等价于清空对话）")
+	}
+
+	// 原子占用该会话的轮次槽位：回退期间到达的 prompt 会排队而不是并行执行
+	//（agent 侧同样要求回退时会话空闲）。判定与登记在同一临界区内完成，
+	// 避免「检查通过后、登记前」被 prompt 帧插队。
+	key := promptQueueKey(agentID, sessionID)
+	b.promptQueueMu.Lock()
+	if b.hasTurnLocked(key) || b.manager.HasPromptInProgress(agentID, sessionID) {
+		b.promptQueueMu.Unlock()
+		return fmt.Errorf("当前会话有轮次在执行或排队，停止后再回退")
+	}
+	b.activeTurns[key] = true
+	b.promptQueueMu.Unlock()
+	// 释放并接力：回退期间被排队的 prompt 在此正常发出（与 runTurn 同一口径）
+	defer b.chainNextQueued(agentID, sessionID)
+
+	if err := b.manager.EnsureStarted(ctx, agentID); err != nil {
+		return err
+	}
+	_, err = b.manager.Rewind(ctx, agentID, sessionID, target.AgentMessageID)
+	if err != nil && manager.IsUnknownSessionErr(err) {
+		// agent 侧重建过（服务重启等）：与 prompt 路径同一套恢复（优先 session/load
+		// 保留上下文），恢复后重试一次。回退锚点是磁盘上的消息 uuid，load 回来仍有效。
+		b.log.Warn("rewind: acp session invalid, recovering", "sessionID", sessionID, "err", err)
+		if newID, ok := b.recoverSession(ctx, dbSession, agentID, sessionID); ok {
+			sessionID = newID
+			_, err = b.manager.Rewind(ctx, agentID, sessionID, target.AgentMessageID)
+		}
+	}
+	if err != nil {
+		return err
+	}
+
+	deleted, err := b.msgRepo.DeleteFromID(dbSession.ID, target.ID)
+	if err != nil {
+		// agent 侧已回退、本地删除失败：两侧不一致，明确告知调用方（不要静默）
+		return fmt.Errorf("agent 侧已回退，但本地历史清理失败: %w", err)
+	}
+	b.log.Info("session rewound",
+		"sessionID", sessionID, "targetMessageID", target.ID, "deleted", deleted)
+	b.handler.BroadcastRewindDone(sessionID, target.ID)
+	return nil
 }
 
 // recoverSession 处理 ACP session 失效（服务端/agent 重启后 DB 记录仍在但 agent 端丢失）：

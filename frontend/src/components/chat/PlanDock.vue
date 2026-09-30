@@ -47,9 +47,11 @@ const buttonLabel = computed(() => {
     class="group"
     @keydown.esc="pinned = false"
   >
+    <!-- 不再画圆形底板（border + bg + shadow）：悬浮在消息区左缘时那个圆盘视觉过重，
+         只留图标本身；hover/聚焦仍有底色反馈（见 buttonClass 与下方 rounded-lg 命中区） -->
     <button
       type="button"
-      class="flex h-10 w-10 cursor-pointer items-center justify-center rounded-full border border-divider bg-surface-raised shadow-sm transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/50"
+      class="flex h-10 w-10 cursor-pointer items-center justify-center rounded-lg transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/50"
       :class="buttonClass"
       :aria-label="buttonLabel"
       :aria-controls="`session-plan-panel-${sessionId}`"

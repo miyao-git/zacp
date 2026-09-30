@@ -71,6 +71,11 @@ type Bridge struct {
 	// 历史回放、不是本轮输出。静音期间该 session 的 push 事件直接丢弃：不入缓存、
 	// 不触发 onEvent 广播。
 	mutedSessions map[string]bool
+	// silentSessions 会话级「只缓存不广播」集合：用于内部指令轮（如 /rewind），
+	// agent 的回执文本（"Rewound to before message …"）属于控制面结果，不应作为
+	// 对话气泡推给前端；但仍需入缓存，调用方要靠 AgentText 读回执判断成败。
+	// 与 mutedSessions 的区别：静音是整体丢弃（历史回放无用），静默是保留但不外发。
+	silentSessions map[string]bool
 	// lastPushAt 各会话最近一次收到事件的时刻（**含被静音丢弃的**）。
 	// 静音窗口要按「事件停止到达」而不是「session/load 响应返回」来关闭，
 	// 见 WaitForReplayQuiescence。
@@ -109,6 +114,7 @@ func New(log *slog.Logger, autoApprove bool) *Bridge {
 		autoApprove:     autoApprove,
 		eventsBySession: make(map[string][]Event),
 		mutedSessions:   make(map[string]bool),
+		silentSessions:  make(map[string]bool),
 		lastPushAt:      make(map[string]time.Time),
 		mutedDropped:    make(map[string]int64),
 	}
@@ -213,6 +219,18 @@ func (b *Bridge) SetMuted(sessionID string, muted bool) {
 	}
 }
 
+// SetSilent 设置/解除指定 ACP session 的「只缓存不广播」（见 silentSessions 字段注释）。
+// 由内部指令轮（/rewind）在发送前打开、收尾时关闭。
+func (b *Bridge) SetSilent(sessionID string, silent bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if silent {
+		b.silentSessions[sessionID] = true
+	} else {
+		delete(b.silentSessions, sessionID)
+	}
+}
+
 // WaitForReplayQuiescence 阻塞到该会话的事件流静默下来（或超时）。
 //
 // 为什么需要：ACP 的预期是 agent 在 session/load **响应之前**把历史上下文回放成
@@ -294,6 +312,10 @@ func (b *Bridge) push(e Event) {
 	}
 	b.eventsBySession[e.SessionID] = append(b.eventsBySession[e.SessionID], e)
 	fn := b.onEvent
+	// 静默轮（内部指令，如 /rewind）：事件已入缓存供调用方读回执，但不外发到前端
+	if b.silentSessions[e.SessionID] {
+		fn = nil
+	}
 	b.mu.Unlock()
 	if fn != nil {
 		fn(e)

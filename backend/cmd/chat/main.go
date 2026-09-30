@@ -130,7 +130,7 @@ func main() {
 		}
 
 		turnCtx, turnCancel := context.WithTimeout(ctx, 10*time.Minute)
-		res, err := mgr.Prompt(turnCtx, *agentID, sessionID, line)
+		res, err := mgr.Prompt(turnCtx, *agentID, sessionID, line, manager.PromptOptions{})
 		turnCancel()
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "\nerror: %v\n", err)

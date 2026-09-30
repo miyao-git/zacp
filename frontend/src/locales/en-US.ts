@@ -113,6 +113,9 @@ export default {
     // Steer queue (messages sent while a turn is running: auto-sent after the turn, editable)
     steerEdit: 'Edit this queued message',
     steerSendHint: 'Queue: sent right after the current turn',
+    // Conversation rewind (edit a past message and resend: rewinds chat and files first)
+    rewindEdit: 'Edit',
+    rewindHint: 'Sending rewinds to before this message (undoes the conversation and file changes)',
     placeholder: 'Message the agent…',
     enterHint: 'Enter to send · Shift+Enter for a new line',
     send: 'Send',

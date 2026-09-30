@@ -874,17 +874,17 @@ func (m *Manager) releaseAgent(conn *AgentConnection) {
 }
 
 // Prompt 向指定 session 发送消息，并受全局三槽位 FIFO 调度控制。
-func (m *Manager) Prompt(ctx context.Context, agentID, sessionID, message string) (*PromptResult, error) {
-	return m.prompt(ctx, agentID, sessionID, message, nil)
+func (m *Manager) Prompt(ctx context.Context, agentID, sessionID, message string, opts PromptOptions) (*PromptResult, error) {
+	return m.prompt(ctx, agentID, sessionID, message, nil, opts)
 }
 
 // PromptWithAdmission 与 Prompt 相同；admitted 在请求登记进全局 FIFO 后调用，
 // 供 WebSocket 入口按帧到达顺序放行下一条请求，避免前置落库耗时造成 FIFO 反转。
-func (m *Manager) PromptWithAdmission(ctx context.Context, agentID, sessionID, message string, admitted func()) (*PromptResult, error) {
-	return m.prompt(ctx, agentID, sessionID, message, admitted)
+func (m *Manager) PromptWithAdmission(ctx context.Context, agentID, sessionID, message string, admitted func(), opts PromptOptions) (*PromptResult, error) {
+	return m.prompt(ctx, agentID, sessionID, message, admitted, opts)
 }
 
-func (m *Manager) prompt(ctx context.Context, agentID, sessionID, message string, admitted func()) (*PromptResult, error) {
+func (m *Manager) prompt(ctx context.Context, agentID, sessionID, message string, admitted func(), opts PromptOptions) (*PromptResult, error) {
 	key := promptKey{agentID: agentID, sessionID: sessionID}
 	qctx, qcancel := context.WithCancel(ctx)
 	entry := &promptEntry{cancel: qcancel}
@@ -925,7 +925,50 @@ func (m *Manager) prompt(ctx context.Context, agentID, sessionID, message string
 		return nil, err
 	}
 	defer m.releaseAgent(conn)
-	return conn.Prompt(ctx, acp.SessionId(sessionID), message)
+	return conn.Prompt(ctx, acp.SessionId(sessionID), message, opts)
+}
+
+// rewindResultPrefixes 为 /rewind 回执的失败前缀（qodercli 实测文案）：
+//   - "Usage: /rewind <message-id>"                        缺参数
+//   - "No user message found for id: …"                    锚点不存在（已被回退掉/非人类消息 id）
+//   - "Command /rewind requires interactive UI …"           agent 不支持在 ACP 下回退
+//
+// 成功回执形如 "Rewound to before message <id>. Restored 1 file."。
+// 文案属于 agent 实现细节，因此只在明确命中失败前缀时判失败，其余按成功处理，
+// 避免上游改个措辞就把正常回退误判成错误。
+var rewindFailurePrefixes = []string{
+	"Usage: /rewind",
+	"No user message found",
+	"Command /rewind requires interactive UI",
+	"Unknown command",
+}
+
+// Rewind 让 agent 把会话回退到指定用户消息**之前**（qodercli 语义：对话分支切回该消息
+// 之前，同时把该消息之后被改动过的文件从检查点还原）。
+//
+// 实现方式：ACP 协议没有 rewind 方法，qodercli 在 ACP 模式下专门放行了
+// `/rewind <message-id>` 这一条斜杠命令（本地执行、不调模型、约 100ms）。
+// 因此这里以「静默指令轮」的形式走同一条 prompt 通路：
+//   - 复用全局槽位与 per-session 互斥，天然不会与正在执行的对话轮并发
+//    （qodercli 侧也要求回退时会话必须空闲，否则会拒绝）；
+//   - Silent 让回执不进前端对话流，只由本函数判定成败后返回。
+//
+// 返回 agent 的回执文本（供上层记日志）。失败时返回 error，调用方不应改动本地数据。
+func (m *Manager) Rewind(ctx context.Context, agentID, sessionID, targetMessageID string) (string, error) {
+	if targetMessageID == "" {
+		return "", fmt.Errorf("rewind: empty target message id")
+	}
+	result, err := m.prompt(ctx, agentID, sessionID, "/rewind "+targetMessageID, nil, PromptOptions{Silent: true})
+	if err != nil {
+		return "", err
+	}
+	reply := strings.TrimSpace(result.Reply)
+	for _, prefix := range rewindFailurePrefixes {
+		if strings.HasPrefix(reply, prefix) {
+			return reply, fmt.Errorf("rewind rejected by agent: %s", reply)
+		}
+	}
+	return reply, nil
 }
 
 // Cancel 取消指定 session 的 prompt：排队中的撤销 FIFO 等待，执行中的发送 ACP cancel。
@@ -1336,12 +1379,29 @@ type PromptResult struct {
 	StopReason string            `json:"stopReason,omitempty"`
 	Events     []acpclient.Event `json:"events"`
 	DurationMs int64             `json:"durationMs"`
+	// UserMessageID agent 确认的用户消息 id（ACP PromptResponse.userMessageId）。
+	// 客户端在 PromptOptions.MessageID 里指定时 agent 原样回显；未指定时由 agent 自行分配。
+	// 它是 `/rewind <message-id>` 的锚点，落库到 messages.agent_message_id。
+	UserMessageID string `json:"userMessageId,omitempty"`
+}
+
+// PromptOptions 单次 prompt 的可选项；零值即普通对话轮。
+type PromptOptions struct {
+	// MessageID 客户端指定的消息 id（ACP PromptRequest.messageId，协议要求 UUID 格式）。
+	// qodercli 会采纳它作为会话文件里的消息 uuid，因此这条消息事后可被
+	// `/rewind <message-id>` 精确定位；留空则由 agent 自行分配（仍会在响应里回传）。
+	MessageID string
+	// Silent 为 true 时本轮事件只进会话缓存、不广播到 WebSocket，也不触发 turn.started
+	//（不注册会话事件回调）。用于「内部指令轮」——如 /rewind 的回执
+	// "Rewound to before message …" 属于控制面结果，不该以对话气泡出现在前端。
+	// 缓存保留，调用方从 PromptResult.Reply 读回执判断成败。
+	Silent bool
 }
 
 // Prompt 发送消息并等待响应。
 // Manager 已在调用前取得全局执行槽位；同一 Agent 的多个 session 可以并发向
 // ACP 发送 prompt。事件缓存按 session id 隔离，取消确认也按 session 隔离。
-func (c *AgentConnection) Prompt(ctx context.Context, sessionID acp.SessionId, message string) (*PromptResult, error) {
+func (c *AgentConnection) Prompt(ctx context.Context, sessionID acp.SessionId, message string, opts PromptOptions) (*PromptResult, error) {
 	message = strings.TrimSpace(message)
 	if message == "" {
 		return nil, fmt.Errorf("empty message")
@@ -1356,8 +1416,13 @@ func (c *AgentConnection) Prompt(ctx context.Context, sessionID acp.SessionId, m
 	c.mu.Unlock()
 
 	// Manager 的全局槽位已获得：现在才注册本 session 的事件回调和取消确认。
-	if c.onPromptStarted != nil {
+	// 静默轮跳过：它不是对话轮，不该广播 turn.started，也不该覆盖已注册的事件回调。
+	if !opts.Silent && c.onPromptStarted != nil {
 		c.onPromptStarted(string(sessionID))
+	}
+	if opts.Silent {
+		c.bridge.SetSilent(string(sessionID), true)
+		defer c.bridge.SetSilent(string(sessionID), false)
 	}
 	c.bridge.ResetSession(string(sessionID))
 	defer c.bridge.ResetSession(string(sessionID))
@@ -1374,10 +1439,14 @@ func (c *AgentConnection) Prompt(ctx context.Context, sessionID acp.SessionId, m
 		close(done)
 	}()
 
-	resp, err := conn.Prompt(ctx, acp.PromptRequest{
+	req := acp.PromptRequest{
 		SessionId: sessionID,
 		Prompt:    []acp.ContentBlock{acp.TextBlock(message)},
-	})
+	}
+	if opts.MessageID != "" {
+		req.MessageId = &opts.MessageID
+	}
+	resp, err := conn.Prompt(ctx, req)
 	if err != nil {
 		// 强制 kill 兜底触发时，进程死亡使 conn.Prompt 返回连接错误；
 		// 识别为「已取消」，避免对已点停止的用户再弹错误。
@@ -1391,13 +1460,17 @@ func (c *AgentConnection) Prompt(ctx context.Context, sessionID acp.SessionId, m
 		return nil, fmt.Errorf("prompt: %w", err)
 	}
 
-	return &PromptResult{
+	result := &PromptResult{
 		SessionID:  string(sessionID),
 		Reply:      c.bridge.AgentText(string(sessionID)),
 		StopReason: string(resp.StopReason),
 		Events:     c.bridge.Events(string(sessionID)),
 		DurationMs: time.Since(start).Milliseconds(),
-	}, nil
+	}
+	if resp.UserMessageId != nil {
+		result.UserMessageID = *resp.UserMessageId
+	}
+	return result, nil
 }
 
 // Cancel 取消正在执行的 prompt；排队中的 prompt 由 Manager.Cancel 在全局 FIFO
