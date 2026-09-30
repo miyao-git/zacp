@@ -469,7 +469,7 @@ const hasResponseContent = computed(() => visibleBlocks.value.length > 0)
     <details
       v-if="!isUser && hasThought"
       :open="reasoningOpen"
-      class="w-full rounded-lg border border-divider bg-surface-raised px-3 py-2 text-xs leading-relaxed text-ink-muted shadow-sm"
+      class="mt-1 w-full rounded-lg border border-divider bg-surface-raised px-3 py-2 text-xs leading-relaxed text-ink-muted shadow-sm"
       @toggle="onToggleReasoning"
     >
       <summary class="cursor-pointer select-none font-medium text-ink-muted">
@@ -487,10 +487,11 @@ const hasResponseContent = computed(() => visibleBlocks.value.length > 0)
          与用户消息的「编辑/回退」页脚同一套样式与逻辑：整条页脚在本轮响应结束后出现，
          复制按钮 hover 显示、触屏常显；复制成功短暂切对勾反馈。
          响应时间 = 该 assistant 消息落库时刻（turn 收尾时间），与用户页脚的发送时刻同源。
-         不加 -mt-1：与正文、思考框统一走外层 gap-2 间距，三者边距一致。 -->
+         加 mt-1：正文→思考框、思考框→响应时间统一为 gap-2 + mt-1 = 12px，
+         三者边距一致且不会让时间贴着思考框卡片。 -->
     <div
       v-if="!isUser && isFinished && hasResponseContent"
-      class="flex items-center gap-1 pl-0.5 text-xs leading-4 text-ink-muted"
+      class="mt-1 flex items-center gap-1 pl-0.5 text-xs leading-4 text-ink-muted"
     >
       <span v-if="sentAt" class="tabular-nums">{{ sentAt }}</span>
       <button
