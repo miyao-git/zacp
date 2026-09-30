@@ -2,7 +2,7 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { IncremarkContent } from '@incremark/vue'
-import { CheckmarkOutline, CopyOutline, CreateOutline } from '@vicons/ionicons5'
+import { ArrowDownOutline, CheckmarkOutline, CopyOutline, CreateOutline } from '@vicons/ionicons5'
 import { NIcon } from 'naive-ui'
 import { fetchMessageThoughts } from '@/api'
 import { copyText } from '@/utils/clipboard'
@@ -20,10 +20,18 @@ const { t } = useI18n()
 const sessionStore = useSessionStore()
 
 /**
- * 思考过程滚动容器（面板默认展开，固定 5 行高的窗口，自动贴底显示最新思考）。
- * 内容变化与展开时都会滚到底部（见 scrollReasoningToBottom）。
+ * 思考过程滚动容器（固定 5 行高的窗口）。
+ * 是否贴底由 reasoningAtBottom 决定（跟随尾部 + 上滚暂停，见 scrollReasoningToBottom）。
  */
 const reasoningBodyRef = ref<HTMLElement | null>(null)
+
+/**
+ * 用户是否仍贴在思考窗口底部（跟随尾部开关）。
+ * 默认 true：流式期间内容增长自动贴底，保留"在滚动、模型在工作"的视觉信号；
+ * 用户在窗口内上滚（onReasoningScroll 检测到离开底部）即置 false 暂停自动贴底，
+ * 可安心阅读早前思考；滚回底部或点"回到最新"恢复跟随。
+ */
+const reasoningAtBottom = ref(true)
 
 /** 按需加载的思考过程缓存（展开面板时请求 /thoughts，组件实例级；重复展开不重复请求） */
 const loadedReasoning = ref('')
@@ -131,20 +139,44 @@ async function ensureReasoningLoaded() {
   reasoningLoadState.value = 'loaded'
 }
 
-/** 把思考窗口滚到底部（贴住最新一行）：内容增长、异步加载完成与面板展开时调用 */
-function scrollReasoningToBottom() {
+/**
+ * 把思考窗口滚到底部（贴住最新一行）。
+ * 自动贴底仅在「流式期间 + 用户仍跟随尾部（reasoningAtBottom）」时生效：
+ * 既保留"内容在滚、模型在工作"的视觉信号，又不在用户上滚阅读时把人拽回。
+ * turn 结束后（非流式）不再自动贴底——展开回看从自然位置开始，不强制置底。
+ * force=true（点"回到最新"按钮）时无条件贴底并恢复跟随。
+ * 注意：不用 smooth 行为，token 高频追加时平滑动画会累积排队，反而卡顿。
+ */
+function scrollReasoningToBottom(force = false) {
+  if (!force && (!isStreamingPlaceholder.value || !reasoningAtBottom.value)) {
+    return
+  }
   void nextTick(() => {
     const el = reasoningBodyRef.value
     el?.scrollTo({ top: el.scrollHeight })
+    if (force) {
+      reasoningAtBottom.value = true
+    }
   })
 }
 
+/** 思考窗口滚动：记录用户是否仍贴底，决定是否继续自动跟随（见 reasoningAtBottom） */
+function onReasoningScroll() {
+  const el = reasoningBodyRef.value
+  if (!el) {
+    return
+  }
+  reasoningAtBottom.value = el.scrollHeight - el.scrollTop - el.clientHeight < 8
+}
+
 /**
- * 面板展开钩子：默认展开（首次无需触发）；用户折叠后再展开时作为失败重试入口，
- * 并把窗口重新贴到底部（折叠期间内容可能已增长）。
+ * 面板展开/收起钩子：回写 reasoningOpen（与 :open 双向同步），
+ * 展开时作为按需加载的失败重试入口，并尝试贴底（流式且跟随时才真正贴底）。
  */
 function onToggleReasoning(e: Event) {
-  if (!(e.target as HTMLDetailsElement).open) {
+  const open = (e.target as HTMLDetailsElement).open
+  reasoningOpen.value = open
+  if (!open) {
     return
   }
   void ensureReasoningLoaded()
@@ -176,6 +208,21 @@ const isStreamingPlaceholder = computed(
     sessionStore.statusOf(props.message.sessionId) === 'streaming' &&
     sessionStore.activeMessages.at(-1)?.id === props.message.id,
 )
+
+/**
+ * 思考面板展开态：流式期间默认展开（实时看思考滚动），turn 结束自动收起为单行标题；
+ * 历史消息（非流式）默认收起。用户手动展开/收起经 onToggleReasoning 回写本 ref。
+ */
+const reasoningOpen = ref(isStreamingPlaceholder.value)
+
+// turn 开始/结束时同步展开态：开始→展开并恢复跟随，结束→自动收起。
+// 同一轮内 isStreamingPlaceholder 保持不变，因此用户流式中手动收起不会被强制打开。
+watch(isStreamingPlaceholder, (streaming) => {
+  reasoningOpen.value = streaming
+  if (streaming) {
+    reasoningAtBottom.value = true
+  }
+})
 
 /** 复制成功后的短暂「已复制」反馈（图标切对勾，1.5s 后自动复原） */
 const copied = ref(false)
@@ -448,43 +495,48 @@ const hasResponseContent = computed(() => visibleBlocks.value.length > 0)
       <span v-for="i in 3" :key="i" class="loading-dot" />
     </div>
 
-    <!-- 思维/推理文本：固定在回复底部（正式内容之后），默认展开；
-         窗口最高 5 行、自动贴底滚动显示最新思考，点击标题可折叠 -->
+    <!-- 思维/推理文本：固定在回复底部（正式内容之后）。
+         流式期间展开、窗口最高 5 行并跟随尾部滚动；turn 结束自动收起为单行标题。
+         保留卡片框（与工具卡同款 border + 阴影），但不用黄色底——中性 surface 色。 -->
     <details
       v-if="!isUser && hasThought"
-      open
-      class="w-full rounded-lg bg-amber-50/70 px-3 py-2 text-xs leading-relaxed text-slate-500 ring-1 ring-inset ring-amber-100 dark:bg-amber-500/10 dark:text-amber-200/80 dark:ring-amber-500/20"
+      :open="reasoningOpen"
+      class="w-full rounded-lg border border-divider bg-surface-raised px-3 py-2 text-xs leading-relaxed text-ink-muted shadow-sm"
       @toggle="onToggleReasoning"
     >
-      <summary
-        class="cursor-pointer select-none font-medium"
-        :class="
-          isStreamingPlaceholder
-            ? 'text-amber-600 dark:text-amber-400'
-            : 'text-ink-muted'
-        "
-      >
-        <!-- 思考中：显示「思考中」+ 弹跳圆点（amber 活跃色）；turn.done 后切回「思考过程」且圆点消失 -->
+      <summary class="cursor-pointer select-none font-medium text-ink-muted">
         {{ isStreamingPlaceholder ? t('chat.reasoningThinking') : t('chat.reasoning') }}
-        <span v-if="isStreamingPlaceholder" class="inline-flex items-center gap-1 align-middle">
-          <span v-for="i in 3" :key="i" class="loading-dot loading-dot-sm" />
-        </span>
       </summary>
-      <div
-        ref="reasoningBodyRef"
-        class="reasoning-scroll mt-1.5 max-h-[5lh] overflow-y-auto overscroll-contain wrap-anywhere break-words whitespace-pre-wrap [overflow-wrap:anywhere] pr-2 [word-break:break-word]"
-      >
-        {{ reasoningLoadState === 'loading' ? t('chat.reasoningLoading') : reasoning }}
+      <div class="relative mt-1.5">
+        <div
+          ref="reasoningBodyRef"
+          class="reasoning-scroll max-h-[5lh] overflow-y-auto overscroll-contain wrap-anywhere break-words whitespace-pre-wrap [overflow-wrap:anywhere] pr-2 [word-break:break-word]"
+          @scroll="onReasoningScroll"
+        >
+          {{ reasoningLoadState === 'loading' ? t('chat.reasoningLoading') : reasoning }}
+        </div>
+        <!-- 回到最新：用户上滚暂停跟随后出现，点击恢复贴底跟随（仅流式期间） -->
+        <button
+          v-if="isStreamingPlaceholder && !reasoningAtBottom"
+          type="button"
+          class="absolute bottom-1 right-2 flex cursor-pointer items-center rounded-full border border-divider bg-surface-raised p-1 text-ink-secondary shadow-sm transition-colors hover:bg-surface-hover hover:text-ink"
+          :aria-label="t('chat.reasoningFollow')"
+          :title="t('chat.reasoningFollow')"
+          @click="scrollReasoningToBottom(true)"
+        >
+          <n-icon :size="12"><ArrowDownOutline /></n-icon>
+        </button>
       </div>
     </details>
 
     <!-- AI 回复页脚：响应时间（最左）+ 一键复制（hover 时出现在时间右侧）。
          与用户消息的「编辑/回退」页脚同一套样式与逻辑：整条页脚在本轮响应结束后出现，
          复制按钮 hover 显示、触屏常显；复制成功短暂切对勾反馈。
-         响应时间 = 该 assistant 消息落库时刻（turn 收尾时间），与用户页脚的发送时刻同源。 -->
+         响应时间 = 该 assistant 消息落库时刻（turn 收尾时间），与用户页脚的发送时刻同源。
+         不加 -mt-1：与正文、思考框统一走外层 gap-2 间距，三者边距一致。 -->
     <div
       v-if="!isUser && isFinished && hasResponseContent"
-      class="-mt-1 flex items-center gap-1 pl-0.5 text-xs leading-4 text-ink-muted"
+      class="flex items-center gap-1 pl-0.5 text-xs leading-4 text-ink-muted"
     >
       <span v-if="sentAt" class="tabular-nums">{{ sentAt }}</span>
       <button
@@ -528,19 +580,9 @@ const hasResponseContent = computed(() => visibleBlocks.value.length > 0)
 html.dark .reasoning-scroll {
   scrollbar-color: rgb(71 85 105 / 0.9) transparent; /* slate-600 */
 }
-/* 思考中 summary 内的小号圆点：尺寸更小、amber-600 色，与「思考中」活跃提示一致；
-   动画复用上方 loading-dot（弹跳），本类仅覆盖尺寸与颜色（须定义在 .loading-dot 之后） */
-.loading-dot-sm {
-  width: 4px;
-  height: 4px;
-  background-color: #d97706; /* amber-600 */
-}
 /* 暗色下 loading 圆点提亮一档（.dark 由 stores/app applyThemeClass 控制，scoped 内用 html.dark 选择器） */
 html.dark .loading-dot {
   background-color: #cbd5e1; /* slate-300 */
-}
-html.dark .loading-dot-sm {
-  background-color: #f59e0b; /* amber-500 */
 }
 @keyframes loading-dot-bounce {
   0%,

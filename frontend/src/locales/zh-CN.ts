@@ -111,6 +111,7 @@ export default {
     reasoning: '思考过程',
     reasoningThinking: '思考中',
     reasoningLoading: '思考过程加载中…',
+    reasoningFollow: '回到最新',
     // steer 排队条（响应过程中发送的消息：本轮结束后自动发出，可编辑取回）
     steerEdit: '编辑这条排队消息',
     steerSendHint: '排队发送：本轮回复结束后自动发出',
