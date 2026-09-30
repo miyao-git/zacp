@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	acp "github.com/coder/acp-go-sdk"
 	"github.com/google/uuid"
 	acpclient "github.com/helloxz/zacp/internal/acp/client"
 	"github.com/helloxz/zacp/internal/acp/manager"
@@ -704,23 +705,28 @@ func (s *SessionService) GetSlashCommands(sessionID uint) ([]model.AvailableComm
 
 // SetConfigOption 设置会话配置项（如切换模型/思考强度/mode），并回写 DB 中该选项的 currentValue。
 // 按选项类型分流：select 走 ValueId，boolean 走 Boolean 变体。
-func (s *SessionService) SetConfigOption(ctx context.Context, sessionID uint, optionID, valueID string) error {
+//
+// 返回 agent 响应携带的全量配置项（ACP 规范：session/set_config_option 响应即最新全量列表）。
+// 切换模型会改变各模型实际可用的配置项（如不支持思考强度的模型不再下发该选项），
+// 因此有返回时以其为准整体替换存档并返回给前端；agent 未返回（列表为空）时返回 nil，
+// 调用方沿用旧的「本地回写 currentValue + 前端延时重拉」路径。
+func (s *SessionService) SetConfigOption(ctx context.Context, sessionID uint, optionID, valueID string) ([]model.ConfigOptionDTO, error) {
 	session, err := s.sessionRepo.GetByID(sessionID)
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return ErrSessionNotFound
+			return nil, ErrSessionNotFound
 		}
-		return fmt.Errorf("get session: %w", err)
+		return nil, fmt.Errorf("get session: %w", err)
 	}
 	if session.ACPSessionID == "" {
-		return ErrNoACPSession
+		return nil, ErrNoACPSession
 	}
 
 	// 按需启动兜底：服务端重启后仅预启动第一个 agent，对其它 agent 的
 	// 旧会话下发配置时先确保进程已启动（幂等），否则 mgr.SetSessionConfigOption
 	// 会返回 "agent not started"。
 	if err := s.mgr.EnsureStarted(ctx, session.AgentID); err != nil {
-		return fmt.Errorf("ensure agent started: %w", err)
+		return nil, fmt.Errorf("ensure agent started: %w", err)
 	}
 
 	// 从已存配置项判断类型（缺省按 select 处理）
@@ -737,18 +743,29 @@ func (s *SessionService) SetConfigOption(ctx context.Context, sessionID uint, op
 		}
 	}
 
+	var updated []acp.SessionConfigOption
 	if optType == "boolean" {
 		val := valueID == "true" || valueID == "1"
-		if err := s.setConfigOptionBooleanWithRecovery(ctx, session, optionID, val); err != nil {
-			return err
-		}
+		updated, err = s.setConfigOptionBooleanWithRecovery(ctx, session, optionID, val)
 	} else {
-		if err := s.setConfigOptionWithRecovery(ctx, session, optionID, valueID); err != nil {
-			return err
-		}
+		updated, err = s.setConfigOptionWithRecovery(ctx, session, optionID, valueID)
+	}
+	if err != nil {
+		return nil, err
 	}
 
-	// 回写 DB：更新对应选项的 currentValue（boolean 存 bool，select 存字符串；失败不影响设置结果）
+	// agent 返回全量配置项：以其为准整体替换存档（各模型真实可用的配置项，
+	// 见函数注释），并原样返回给前端渲染。
+	if len(updated) > 0 {
+		dtos := acpclient.ToConfigOptionDTOs(updated)
+		if data, err := json.Marshal(dtos); err == nil {
+			_ = s.sessionRepo.UpdateConfigOptions(sessionID, string(data))
+		}
+		return dtos, nil
+	}
+
+	// agent 未返回列表：本地回写该选项的 currentValue
+	//（boolean 存 bool，select 存字符串；失败不影响设置结果）
 	if len(opts) > 0 {
 		for i := range opts {
 			if opts[i].ID == optionID {
@@ -763,36 +780,40 @@ func (s *SessionService) SetConfigOption(ctx context.Context, sessionID uint, op
 			_ = s.sessionRepo.UpdateConfigOptions(sessionID, string(data))
 		}
 	}
-	return nil
+	return nil, nil
 }
 
-// setConfigOptionWithRecovery 执行一次 select 型配置设置；
+// setConfigOptionWithRecovery 执行一次 select 型配置设置，返回 agent 下发的全量配置项；
 // 失败且为「agent 侧会话不存在/已失效」（unknown session，如后端或 agent 重启后
 // DB 中的 acp_session_id 在 agent 内存中已丢失）时，自动恢复会话并重试一次，用户无感知。
 // 恢复策略与 ws bridge 的 prompt 路径一致（manager.RecoverSession）：
 // 优先 ACP session/load 保留 agent 持久化上下文，失败则 session/new 重建并更新 DB。
-func (s *SessionService) setConfigOptionWithRecovery(ctx context.Context, session *model.Session, optionID, valueID string) error {
-	if err := s.mgr.SetSessionConfigOption(ctx, session.AgentID, session.ACPSessionID, optionID, valueID); err == nil {
-		return nil
-	} else if !manager.IsUnknownSessionErr(err) {
-		return err
+func (s *SessionService) setConfigOptionWithRecovery(ctx context.Context, session *model.Session, optionID, valueID string) ([]acp.SessionConfigOption, error) {
+	updated, err := s.mgr.SetSessionConfigOption(ctx, session.AgentID, session.ACPSessionID, optionID, valueID)
+	if err == nil {
+		return updated, nil
+	}
+	if !manager.IsUnknownSessionErr(err) {
+		return nil, err
 	}
 	// 会话失效：恢复后重试一次
-	if err := s.recoverACPSession(ctx, session); err != nil {
-		return fmt.Errorf("session %s lost on agent, recover failed: %w", session.ACPSessionID, err)
+	if rerr := s.recoverACPSession(ctx, session); rerr != nil {
+		return nil, fmt.Errorf("session %s lost on agent, recover failed: %w", session.ACPSessionID, rerr)
 	}
 	return s.mgr.SetSessionConfigOption(ctx, session.AgentID, session.ACPSessionID, optionID, valueID)
 }
 
 // setConfigOptionBooleanWithRecovery boolean 型变体，逻辑同 setConfigOptionWithRecovery。
-func (s *SessionService) setConfigOptionBooleanWithRecovery(ctx context.Context, session *model.Session, optionID string, value bool) error {
-	if err := s.mgr.SetSessionConfigOptionBoolean(ctx, session.AgentID, session.ACPSessionID, optionID, value); err == nil {
-		return nil
-	} else if !manager.IsUnknownSessionErr(err) {
-		return err
+func (s *SessionService) setConfigOptionBooleanWithRecovery(ctx context.Context, session *model.Session, optionID string, value bool) ([]acp.SessionConfigOption, error) {
+	updated, err := s.mgr.SetSessionConfigOptionBoolean(ctx, session.AgentID, session.ACPSessionID, optionID, value)
+	if err == nil {
+		return updated, nil
 	}
-	if err := s.recoverACPSession(ctx, session); err != nil {
-		return fmt.Errorf("session %s lost on agent, recover failed: %w", session.ACPSessionID, err)
+	if !manager.IsUnknownSessionErr(err) {
+		return nil, err
+	}
+	if rerr := s.recoverACPSession(ctx, session); rerr != nil {
+		return nil, fmt.Errorf("session %s lost on agent, recover failed: %w", session.ACPSessionID, rerr)
 	}
 	return s.mgr.SetSessionConfigOptionBoolean(ctx, session.AgentID, session.ACPSessionID, optionID, value)
 }

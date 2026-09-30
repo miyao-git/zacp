@@ -1537,22 +1537,34 @@ export const useSessionStore = defineStore('session', () => {
     }
   }
 
-  /** 设置会话配置项（select 型：切换模型/思考强度/mode），成功后更新本地 currentValue */
+  /**
+   * 设置会话配置项（select 型：切换模型/思考强度/mode）。
+   * 后端把 agent 的 set_config_option 响应（ACP 规范：最新全量配置项）原样带回：
+   * 切换模型会改变各模型实际可用的配置（如思考强度选项随模型增减），
+   * 有返回时直接整体替换本地列表，界面即与 agent 真实状态一致；
+   * 未返回（老后端/未实现该返回的 agent）则回写 currentValue 并延时重拉兜底。
+   */
   async function setConfigOption(optionId: string, valueId: string) {
     const sessionId = currentId.value
     if (sessionId === null) {
       return
     }
-    await apiSetConfigOption(sessionId, optionId, valueId)
+    const updated = await apiSetConfigOption(sessionId, optionId, valueId)
     // 本地先回写 currentValue（下拉即时反馈）
     const opt = configOptions.value.find((o) => o.id === optionId)
     if (opt) {
       opt.currentValue = valueId
     }
-    // 稍等 agent 处理完成后重新拉取完整配置项：
-    // 模型切换可能改变可选配置（如切到 deepseek 官方模型后出现思维强度选项），
-    // 即使 agent 不推送 config_option_update，主动刷新也能拿到新列表。
+    if (updated && currentId.value === sessionId) {
+      // 权威列表整体替换（含选项消失的情况：如切到不支持思考强度的模型）
+      configOptions.value = updated
+      return
+    }
+    // 兜底：稍后重新拉取完整配置项（agent 未随响应返回列表时）
     setTimeout(() => {
+      if (currentId.value !== sessionId) {
+        return
+      }
       void loadConfigOptions(sessionId)
     }, 300)
   }

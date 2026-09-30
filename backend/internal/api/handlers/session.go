@@ -259,7 +259,8 @@ func (h *SessionHandler) SetConfigOption(c *gin.Context) {
 		return
 	}
 
-	if err := h.svc.SetConfigOption(c.Request.Context(), uint(id), req.OptionID, req.ValueID); err != nil {
+	updated, err := h.svc.SetConfigOption(c.Request.Context(), uint(id), req.OptionID, req.ValueID)
+	if err != nil {
 		// 区分错误语义：会话不存在 404、未建立 ACP 连接 409、
 		// agent 拒绝（值无效/选项未知，属客户端参数问题）400，其余为服务器错误 500
 		switch {
@@ -279,7 +280,13 @@ func (h *SessionHandler) SetConfigOption(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"ok": true})
+	// 随响应返回 agent 下发的最新全量配置项（切换模型后思考强度等选项随模型变化，
+	// 前端据此立即刷新，无需再拉取 GET config-options）；agent 未返回时省略该字段。
+	resp := gin.H{"ok": true}
+	if len(updated) > 0 {
+		resp["configOptions"] = updated
+	}
+	c.JSON(http.StatusOK, resp)
 }
 
 // RenameSession 重命名会话标题（用户手动重命名，仅更新本地 DB）

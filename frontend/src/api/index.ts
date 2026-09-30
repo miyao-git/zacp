@@ -663,15 +663,22 @@ export async function fetchSlashCommands(
   return data.slashCommands
 }
 
-/** POST /api/v1/sessions/:id/config-options — 设置会话配置项（如切换模型） */
+/**
+ * POST /api/v1/sessions/:id/config-options — 设置会话配置项（如切换模型）。
+ * 返回 agent 下发的最新全量配置项：切换模型会改变各模型实际可用的配置
+ * （如不支持思考强度的模型不再下发该选项），前端据此刷新下拉。
+ * agent 未返回列表（响应无该字段）时返回 undefined，调用方走重拉兜底。
+ */
 export async function setConfigOption(
   sessionId: number,
   optionId: string,
   valueId: string,
-): Promise<void> {
-  await http.post(`/api/v1/sessions/${sessionId}/config-options`, {
-    body: { optionId, valueId },
-  })
+): Promise<ConfigOption[] | undefined> {
+  const data = await http.post<{ configOptions?: ConfigOption[] }>(
+    `/api/v1/sessions/${sessionId}/config-options`,
+    { body: { optionId, valueId } },
+  )
+  return data.configOptions
 }
 
 // ---------------------------------------------------------------------------

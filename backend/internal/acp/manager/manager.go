@@ -582,23 +582,25 @@ func (m *Manager) CreateSession(ctx context.Context, agentID, cwd string) (strin
 }
 
 // SetSessionConfigOption 设置会话配置项（如切换模型/思考强度/mode）。
-func (m *Manager) SetSessionConfigOption(ctx context.Context, agentID, sessionID, configID, valueID string) error {
+// 返回 agent 响应携带的全量 configOptions（可能为空：agent 未实现该返回），
+// 由调用方决定是否以其覆盖本地存档与界面。
+func (m *Manager) SetSessionConfigOption(ctx context.Context, agentID, sessionID, configID, valueID string) ([]acp.SessionConfigOption, error) {
 	m.mu.Lock()
 	conn, exists := m.agents[agentID]
 	m.mu.Unlock()
 	if !exists {
-		return fmt.Errorf("agent '%s' not started", agentID)
+		return nil, fmt.Errorf("agent '%s' not started", agentID)
 	}
 	return conn.SetSessionConfigOption(ctx, sessionID, configID, valueID)
 }
 
-// SetSessionConfigOptionBoolean 设置会话配置项（boolean 型开关）。
-func (m *Manager) SetSessionConfigOptionBoolean(ctx context.Context, agentID, sessionID, configID string, value bool) error {
+// SetSessionConfigOptionBoolean 设置会话配置项（boolean 型开关），返回值同上。
+func (m *Manager) SetSessionConfigOptionBoolean(ctx context.Context, agentID, sessionID, configID string, value bool) ([]acp.SessionConfigOption, error) {
 	m.mu.Lock()
 	conn, exists := m.agents[agentID]
 	m.mu.Unlock()
 	if !exists {
-		return fmt.Errorf("agent '%s' not started", agentID)
+		return nil, fmt.Errorf("agent '%s' not started", agentID)
 	}
 	return conn.SetSessionConfigOptionBoolean(ctx, sessionID, configID, value)
 }
@@ -634,7 +636,7 @@ func (m *Manager) replayOptions(ctx context.Context, agentID, sessionID string, 
 			if !ok {
 				continue
 			}
-			if err := m.SetSessionConfigOptionBoolean(ctx, agentID, sessionID, opt.ID, v); err != nil {
+			if _, err := m.SetSessionConfigOptionBoolean(ctx, agentID, sessionID, opt.ID, v); err != nil {
 				m.log.Warn("replay config option failed",
 					"agent", agentID, "sessionId", sessionID, "configId", opt.ID, "err", err)
 			}
@@ -643,7 +645,7 @@ func (m *Manager) replayOptions(ctx context.Context, agentID, sessionID string, 
 			if !ok || v == "" {
 				continue
 			}
-			if err := m.SetSessionConfigOption(ctx, agentID, sessionID, opt.ID, v); err != nil {
+			if _, err := m.SetSessionConfigOption(ctx, agentID, sessionID, opt.ID, v); err != nil {
 				m.log.Warn("replay config option failed",
 					"agent", agentID, "sessionId", sessionID, "configId", opt.ID, "value", v, "err", err)
 			}
@@ -1594,18 +1596,21 @@ func (c *AgentConnection) DeleteSession(ctx context.Context, sessionID acp.Sessi
 }
 
 // SetSessionConfigOption 设置会话配置项（select 型，如模型/思考强度/mode 切换）。
-func (c *AgentConnection) SetSessionConfigOption(ctx context.Context, sessionID, configID, valueID string) error {
+// 返回 agent 响应携带的全量 configOptions（ACP 规范要求）：切换模型后各模型
+// 实际可用的配置项会变（如不支持思考强度的模型不再下发该选项），调用方据此
+// 刷新界面与存档，而不是沿用本地的旧列表。
+func (c *AgentConnection) SetSessionConfigOption(ctx context.Context, sessionID, configID, valueID string) ([]acp.SessionConfigOption, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	if !c.started || c.conn == nil {
-		return fmt.Errorf("agent not started")
+		return nil, fmt.Errorf("agent not started")
 	}
 
 	// 配置切换属于活跃操作，刷新空闲计时
 	c.lastUsed = time.Now()
 
-	_, err := c.conn.SetSessionConfigOption(ctx, acp.SetSessionConfigOptionRequest{
+	resp, err := c.conn.SetSessionConfigOption(ctx, acp.SetSessionConfigOptionRequest{
 		ValueId: &acp.SetSessionConfigOptionValueId{
 			SessionId: acp.SessionId(sessionID),
 			ConfigId:  acp.SessionConfigId(configID),
@@ -1613,24 +1618,24 @@ func (c *AgentConnection) SetSessionConfigOption(ctx context.Context, sessionID,
 		},
 	})
 	if err != nil {
-		return fmt.Errorf("set config option: %w", err)
+		return nil, fmt.Errorf("set config option: %w", err)
 	}
-	return nil
+	return resp.ConfigOptions, nil
 }
 
-// SetSessionConfigOptionBoolean 设置会话配置项（boolean 型开关）。
-func (c *AgentConnection) SetSessionConfigOptionBoolean(ctx context.Context, sessionID, configID string, value bool) error {
+// SetSessionConfigOptionBoolean 设置会话配置项（boolean 型开关），返回值同上。
+func (c *AgentConnection) SetSessionConfigOptionBoolean(ctx context.Context, sessionID, configID string, value bool) ([]acp.SessionConfigOption, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	if !c.started || c.conn == nil {
-		return fmt.Errorf("agent not started")
+		return nil, fmt.Errorf("agent not started")
 	}
 
 	// 配置切换属于活跃操作，刷新空闲计时
 	c.lastUsed = time.Now()
 
-	_, err := c.conn.SetSessionConfigOption(ctx, acp.SetSessionConfigOptionRequest{
+	resp, err := c.conn.SetSessionConfigOption(ctx, acp.SetSessionConfigOptionRequest{
 		Boolean: &acp.SetSessionConfigOptionBoolean{
 			SessionId: acp.SessionId(sessionID),
 			ConfigId:  acp.SessionConfigId(configID),
@@ -1639,9 +1644,9 @@ func (c *AgentConnection) SetSessionConfigOptionBoolean(ctx context.Context, ses
 		},
 	})
 	if err != nil {
-		return fmt.Errorf("set config option: %w", err)
+		return nil, fmt.Errorf("set config option: %w", err)
 	}
-	return nil
+	return resp.ConfigOptions, nil
 }
 
 // Close 关闭 agent 连接。

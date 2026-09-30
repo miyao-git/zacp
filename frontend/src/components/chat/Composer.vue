@@ -8,7 +8,7 @@ import type { InputInst, SelectGroupOption, SelectOption } from 'naive-ui'
 import { useSessionStore, MAX_TURNS_PER_SESSION, type SessionStreamStatus } from '@/stores/session'
 import { uploadTempFiles } from '@/api'
 import { extractPastedFiles, prepareFile } from '@/utils/fileUpload'
-import type { ConfigOptionValue } from '@/types/models'
+import type { ConfigOption, ConfigOptionValue } from '@/types/models'
 
 /** Composer 提交载荷（card / bar 共用） */
 export interface ComposerSubmitPayload {
@@ -80,6 +80,57 @@ async function onConfigChange(optionId: string, valueId: string) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// 思考强度排序：agent 下发的等级顺序不可依赖（实测 qodercli 各模型自定顺序：
+// DeepSeek-Flash 为 High/Max/Low/None、GLM/Kimi 为 High/Low/Max、Qwen 为
+// Extra High/Low/Medium/None），既非字母序也非强度序。前端按下表统一按
+// 强度「从高到低」展示，仅影响下拉列表展示顺序，不改变发给 agent 的取值。
+// ---------------------------------------------------------------------------
+
+/**
+ * 等级 → 强度序（数值越大越强）。
+ * Max 与 Extra High 视为同级最高档：实测同一模型只会出现其中一个
+ * （DeepSeek 系用 max、Qwen 系用 xhigh），语义都是「最高档」；
+ * 万一某 agent 同时下发，稳定排序会保持其原始相对顺序。
+ */
+const EFFORT_RANK: Record<string, number> = {
+  none: 0,
+  off: 0,
+  minimal: 0,
+  low: 1,
+  medium: 2,
+  med: 2,
+  high: 3,
+  xhigh: 4,
+  extrahigh: 4,
+  max: 4,
+}
+
+/** 归一化后查等级（小写、去空格/下划线/连字符）；value 与 name 都认，未识别返回 undefined */
+function effortRank(v: ConfigOptionValue): number | undefined {
+  for (const key of [v.value, v.name]) {
+    const norm = key.toLowerCase().replace(/[\s_-]+/g, '')
+    if (norm in EFFORT_RANK) {
+      return EFFORT_RANK[norm]
+    }
+  }
+  return undefined
+}
+
+/** 思考强度类配置项识别（id 或显示名含 reason/think/effort；仅这类选项做强度排序） */
+function isEffortOption(opt: ConfigOption): boolean {
+  return /reason|think|effort/i.test(opt.id) || /reason|think|effort/i.test(opt.name)
+}
+
+/** 按强度从高到低排序；未识别的取值保持 agent 原顺序，排在已识别项之后 */
+function sortEffortOptions(options: ConfigOptionValue[]): ConfigOptionValue[] {
+  const known = options.filter((o) => effortRank(o) !== undefined)
+  const unknown = options.filter((o) => effortRank(o) === undefined)
+  // sort 稳定：同等级（如 Max / Extra High）保持 agent 下发顺序
+  known.sort((a, b) => effortRank(b)! - effortRank(a)!)
+  return [...known, ...unknown]
+}
+
 /**
  * 把 configOption 的选项列表转成 naive-ui select 的选项/分组结构。
  * 模型选项名约定为「渠道/模型名」：提取第一个 / 前的内容作为渠道分组标题（group 不可选），
@@ -92,13 +143,14 @@ async function onConfigChange(optionId: string, valueId: string) {
  * 而选中后的回显（n-select 固定显示 option.label）则是完整「渠道/模型」，与请求体完全一致，
  * 用户能看到自己选的是哪个渠道的哪个模型。
  */
-function buildSelectOptions(
-  options?: ConfigOptionValue[],
-): Array<SelectGroupOption | SelectOption> {
+function buildSelectOptions(opt?: ConfigOption): Array<SelectGroupOption | SelectOption> {
   const result: Array<SelectGroupOption | SelectOption> = []
+  // 思考强度：先按强度排序（其余选项保持 agent 原顺序）
+  const values =
+    opt && isEffortOption(opt) ? sortEffortOptions(opt.options ?? []) : (opt?.options ?? [])
   // 渠道名 → 该渠道下模型子项；Map 保证组间按渠道首次出现顺序、组内按原顺序
   const groups = new Map<string, SelectOption[]>()
-  for (const v of options ?? []) {
+  for (const v of values) {
     const idx = v.name.indexOf('/')
     if (idx > 0 && idx < v.name.length - 1) {
       // 「渠道/模型」格式：归入对应渠道分组；label 保留完整路径供回显，modelName 供下拉展示
@@ -741,7 +793,7 @@ function onKeydown(e: KeyboardEvent) {
               :value="String(opt.currentValue)"
               size="tiny"
               class="opt-select"
-              :options="buildSelectOptions(opt.options)"
+              :options="buildSelectOptions(opt)"
               :render-label="renderConfigOptionLabel"
               :consistent-menu-width="false"
               filterable
@@ -864,7 +916,7 @@ function onKeydown(e: KeyboardEvent) {
                 class="opt-select"
                 :to="'body'"
                 :filterable="opt.category === 'model'"
-                :options="buildSelectOptions(opt.options)"
+                :options="buildSelectOptions(opt)"
                 :render-label="renderConfigOptionLabel"
                 :consistent-menu-width="false"
                 :filter="filterSelectOption"
