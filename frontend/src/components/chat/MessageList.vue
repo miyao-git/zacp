@@ -223,22 +223,35 @@ onMounted(() => {
 })
 
 // ---------------------------------------------------------------------------
-// 「回到底部」悬浮按钮：滚动时浮现，停止滚动约 2s 后淡出（避免长期遮挡内容）
+// 「回到底部」悬浮按钮：未贴底时常显（随时可点），回到底部后延时约 1s 渐隐
+//
+// 可见性只取决于「是否贴底」这个状态，与滚动事件无关：上翻（atBottom=false）即刻
+// 显示且一直显示——用户随时能看到入口，不必先滚一下把它「晃」出来；回到/贴到底部
+// 后（含点按钮、发送消息、流式跟随）再延迟 HIDE_AFTER_BOTTOM_MS 淡出，避免刚到底
+// 就消失导致的闪烁。延时期间若又上翻，定时器被取消、按钮保持显示。
 // ---------------------------------------------------------------------------
 
-/** 停止滚动后按钮的停留时长：留足余量方便「滚一下再点」，又不会长期挡住内容 */
-const SCROLL_IDLE_HIDE_MS = 2000
+/** 回到/贴到底部后按钮的停留时长（渐隐前的缓冲）：给「回到底部后想再往上一点」留余地 */
+const HIDE_AFTER_BOTTOM_MS = 1000
+/** 按钮是否可见（非贴底时恒为 true；贴底后由定时器延迟置 false） */
 const jumpButtonVisible = ref(false)
 let jumpButtonTimer: ReturnType<typeof setTimeout> | undefined
 
-/** 滚动统一入口：贴底判定 + 按钮浮现 + 当前导航项重算 */
-function handleScroll() {
-  onScroll()
-  jumpButtonVisible.value = true
+/** 贴底状态变化：离开底部立即显示；回到/贴到底部后延时渐隐 */
+watch(atBottom, (bottom) => {
   clearTimeout(jumpButtonTimer)
+  if (!bottom) {
+    jumpButtonVisible.value = true
+    return
+  }
   jumpButtonTimer = setTimeout(() => {
     jumpButtonVisible.value = false
-  }, SCROLL_IDLE_HIDE_MS)
+  }, HIDE_AFTER_BOTTOM_MS)
+})
+
+/** 滚动统一入口：贴底判定 + 当前导航项重算（按钮显隐由 atBottom 驱动） */
+function handleScroll() {
+  onScroll()
   scheduleActiveNavUpdate()
 }
 
@@ -322,14 +335,12 @@ onBeforeUnmount(() => {
     />
 
     <!-- 「回到底部」悬浮按钮：位于对话框正上方居中，样式沿用原回到最底按钮；
-         仅在滚动时浮现（停止滚动约 2s 后淡出），且已贴底时无意义 → 始终隐藏。
+         未贴底时常显，回到底部后约 1s 渐隐（可见性由 atBottom 驱动，见脚本注释）。
          bottom 偏移加悬浮输入层高度，避免被输入条盖住（--composer-h 由 ChatPane 写入） -->
     <button
-      class="absolute bottom-[calc(var(--composer-h,6rem)_+_0.75rem)] left-1/2 z-10 flex h-7 w-7 -translate-x-1/2 cursor-pointer items-center justify-center rounded-full border border-divider bg-surface-raised/90 text-ink-muted shadow-sm backdrop-blur transition-opacity duration-200 hover:bg-surface-hover hover:text-ink"
+      class="absolute bottom-[calc(var(--composer-h,6rem)_+_0.75rem)] left-1/2 z-10 flex h-7 w-7 -translate-x-1/2 cursor-pointer items-center justify-center rounded-full border border-divider bg-surface-raised/90 text-ink-muted shadow-sm backdrop-blur transition-opacity duration-300 hover:bg-surface-hover hover:text-ink"
       :class="
-        jumpButtonVisible && !atBottom
-          ? 'opacity-100'
-          : 'pointer-events-none opacity-0'
+        jumpButtonVisible ? 'opacity-100' : 'pointer-events-none opacity-0'
       "
       :aria-label="t('chat.scrollDown')"
       @click="scrollToBottom(true)"
