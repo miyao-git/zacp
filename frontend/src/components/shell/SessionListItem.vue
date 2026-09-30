@@ -5,7 +5,7 @@ import { useRoute, useRouter } from 'vue-router'
 import {
   CopyOutline,
   CreateOutline,
-  EllipsisHorizontalOutline,
+  EllipsisHorizontal,
   EyeOutline,
   TrashOutline,
 } from '@vicons/ionicons5'
@@ -247,7 +247,7 @@ async function onDelete() {
         @click.stop
       >
         <template #icon>
-          <n-icon :size="16"><EllipsisHorizontalOutline /></n-icon>
+          <n-icon :size="16"><EllipsisHorizontal /></n-icon>
         </template>
       </n-button>
     </n-dropdown>

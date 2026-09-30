@@ -406,6 +406,7 @@ function onNewProjectFromHero() {
                 mode="bar"
                 :agent-id="current.agentId"
                 :status="sessionStore.statusOf(current.id)"
+                :session-id="current.id"
                 :turn-limited="turnCount >= MAX_TURNS_PER_SESSION"
                 @submit="onSubmit"
                 @cancel="sessionStore.cancelSend(current.id)"

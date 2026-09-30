@@ -209,6 +209,12 @@ export const useSessionStore = defineStore('session', () => {
   /** 各会话最近一次成功发出 prompt 的时间（resync 裁决时效保护，见 RESYNC_STALE_GUARD_MS） */
   const lastPromptSentAtBySession = new Map<number, number>()
   /**
+   * 各会话当前 turn 的开始时刻（响应式；key: DB session id）。
+   * 发 prompt 成功时写入，turn 收尾/会话删除时清除；供 Composer 显示当轮已持续时间。
+   * 刷新页面后 resync 恢复 streaming 时补写为恢复时刻（真实起点已丢失，只能从恢复起算）。
+   */
+  const turnStartedAtBySession = ref<Record<number, number>>({})
+  /**
    * 各会话「已回放到的事件序号」（resync 回放的幂等下界）。
    *
    * 后端 push 的「入缓存」与「广播」不是原子的：快照里已包含的事件，可能在回放
@@ -421,6 +427,7 @@ export const useSessionStore = defineStore('session', () => {
 		initialSessionDetailRefresh.delete(sessionId)
 		lastEventAtBySession.delete(sessionId)
 		lastPromptSentAtBySession.delete(sessionId)
+		delete turnStartedAtBySession.value[sessionId]
 		resetReplayTracking(sessionId)
 		delete messagesStatus.value[sessionId]
 		delete statusBySession.value[sessionId]
@@ -450,6 +457,12 @@ export const useSessionStore = defineStore('session', () => {
   function statusOf(sessionId: number | null | undefined): SessionStreamStatus {
     if (sessionId === null || sessionId === undefined) return 'idle'
     return statusBySession.value[sessionId] ?? 'idle'
+  }
+
+  /** 当前 turn 的开始时刻（ms）；无进行中的 turn 时为 undefined */
+  function turnStartedAtOf(sessionId: number | null | undefined): number | undefined {
+    if (sessionId === null || sessionId === undefined) return undefined
+    return turnStartedAtBySession.value[sessionId]
   }
 
   /**
@@ -1560,6 +1573,7 @@ export const useSessionStore = defineStore('session', () => {
     delete pendingPermissionsBySession.value[sessionId]
     runningSessionIds.value.delete(sessionId)
     lastEventAtBySession.delete(sessionId)
+    delete turnStartedAtBySession.value[sessionId]
     resetReplayTracking(sessionId)
     // 出错/保险丝收尾同样接力 steer 队列（用户排队的消息不因一次异常被吞掉；
     // 取消路径已在 cancelSend 清空队列，这里不会误发）
@@ -1579,6 +1593,7 @@ export const useSessionStore = defineStore('session', () => {
     delete pendingPermissionsBySession.value[sessionId]
     runningSessionIds.value.delete(sessionId)
     lastEventAtBySession.delete(sessionId)
+    delete turnStartedAtBySession.value[sessionId]
   }
 
   /** turn 收尾：结束流式状态，随后只同步本轮新增的数据库消息 */
@@ -1895,6 +1910,10 @@ export const useSessionStore = defineStore('session', () => {
             statusBySession.value[sid] = 'streaming'
             runningSessionIds.value.add(sid)
             lastEventAtBySession.set(sid, Date.now())
+            // 刷新/重连后恢复的 turn：真实开始时刻已丢失，用恢复时刻起算持续时间
+            if (turnStartedAtBySession.value[sid] === undefined) {
+              turnStartedAtBySession.value[sid] = Date.now()
+            }
             if (msg.replay && replayIsAhead(sid, msg.replay)) {
               restoreStreamFromReplay(sid, msg.replay)
             }
@@ -2195,6 +2214,8 @@ export const useSessionStore = defineStore('session', () => {
       lastEventAtBySession.set(sessionId, Date.now())
       // 记录发送时刻：晚于此刻发出的 resync 裁决才对本轮有效（见 RESYNC_STALE_GUARD_MS）
       lastPromptSentAtBySession.set(sessionId, Date.now())
+      // 当轮开始时刻：驱动 Composer 的持续时间显示
+      turnStartedAtBySession.value[sessionId] = Date.now()
     }
   }
 
@@ -2300,6 +2321,7 @@ export const useSessionStore = defineStore('session', () => {
     streaming,
     currentStatus,
     statusOf,
+    turnStartedAtOf,
     turnCountOf,
     streamBlocksOf,
     placeholderBlocksOf,

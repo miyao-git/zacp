@@ -2,7 +2,7 @@
 import { computed, h, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import type { VNodeChild } from 'vue'
 import { useI18n } from 'vue-i18n'
-import { AddOutline, CreateOutline, OptionsOutline, StopOutline } from '@vicons/ionicons5'
+import { AddOutline, CreateOutline, OptionsOutline, Stop } from '@vicons/ionicons5'
 import { NIcon, useMessage } from 'naive-ui'
 import type { InputInst, SelectGroupOption, SelectOption } from 'naive-ui'
 import { useSessionStore, MAX_TURNS_PER_SESSION, type SessionStreamStatus } from '@/stores/session'
@@ -28,10 +28,12 @@ const props = withDefaults(
      * idle=可发送 / queued=已发送排队中（可取消）/ streaming=流式进行中（停止按钮）
      */
     status?: SessionStreamStatus
+    /** bar 模式当前会话的 DB id：用于从 store 取当轮开始时刻，显示持续时间 */
+    sessionId?: number
     /** 会话轮次达到上限（MAX_TURNS_PER_SESSION）：输入框与发送按钮一并禁用，显示提示条。 */
     turnLimited?: boolean
   }>(),
-  { mode: 'bar', agentId: undefined, status: 'idle', turnLimited: false },
+  { mode: 'bar', agentId: undefined, status: 'idle', sessionId: undefined, turnLimited: false },
 )
 
 const emit = defineEmits<{
@@ -458,6 +460,48 @@ function focus() {
 
 defineExpose({ focus })
 
+// ---------------------------------------------------------------------------
+// 当轮持续时间：turn 进行中（status ≠ idle）每秒刷新一次已耗时，显示在停止按钮左侧。
+// 起点取 store 的 turnStartedAtOf（发 prompt 成功时写入；刷新后 resync 恢复时补写）。
+// ---------------------------------------------------------------------------
+const elapsedText = ref('')
+let elapsedTimer: ReturnType<typeof setInterval> | undefined
+
+function updateElapsed() {
+  const startedAt = sessionStore.turnStartedAtOf(props.sessionId)
+  if (startedAt === undefined) {
+    elapsedText.value = ''
+    return
+  }
+  const sec = Math.max(0, Math.floor((Date.now() - startedAt) / 1000))
+  const m = Math.floor(sec / 60)
+  const s = sec % 60
+  elapsedText.value = `${m}:${String(s).padStart(2, '0')}`
+}
+
+function stopElapsedTimer() {
+  clearInterval(elapsedTimer)
+  elapsedTimer = undefined
+  elapsedText.value = ''
+}
+
+watch(
+  () => props.status,
+  (status) => {
+    if (status === 'idle') {
+      stopElapsedTimer()
+      return
+    }
+    if (elapsedTimer === undefined) {
+      updateElapsed()
+      elapsedTimer = setInterval(updateElapsed, 1000)
+    }
+  },
+  { immediate: true },
+)
+
+onBeforeUnmount(stopElapsedTimer)
+
 /** bar 模式会话切换时同步外部 agentId */
 watch(
   () => props.agentId,
@@ -703,6 +747,13 @@ function onKeydown(e: KeyboardEvent) {
       </div>
 
       <div class="flex shrink-0 items-center gap-2">
+        <!-- 当轮持续时间（m:ss）：turn 进行中显示在停止按钮左侧 -->
+        <span
+          v-if="status !== 'idle' && elapsedText"
+          class="text-xs tabular-nums text-ink-muted"
+        >
+          {{ elapsedText }}
+        </span>
         <!-- 排队中：停止按钮 + 状态文案（可取消排队；A 结束后自动开跑） -->
         <span
           v-if="status === 'queued'"
@@ -719,17 +770,18 @@ function onKeydown(e: KeyboardEvent) {
           <n-spin :size="13" />
           {{ t('chat.stopping') }}
         </span>
-        <!-- 处理中（排队/流式/停止确认）：红色停止按钮 -->
+        <!-- 处理中（排队/流式/停止确认）：红色停止按钮（小尺寸 + 实心方块） -->
         <n-button
           v-if="status !== 'idle'"
           type="error"
-          size="small"
+          size="tiny"
           circle
+          class="h-6! w-6!"
           :disabled="status === 'cancelling'"
           @click="emit('cancel')"
         >
           <template #icon>
-            <n-icon :size="16"><StopOutline /></n-icon>
+            <n-icon :size="12"><Stop /></n-icon>
           </template>
         </n-button>
       </div>

@@ -5,14 +5,13 @@ import { useRoute, useRouter } from 'vue-router'
 import {
   AddOutline,
   ChevronDownOutline,
-  EllipsisHorizontalOutline,
+  EllipsisHorizontal,
   FolderOpenOutline,
   FolderOutline,
   TrashOutline,
 } from '@vicons/ionicons5'
 import { NIcon, useMessage, type DropdownOption } from 'naive-ui'
 import { useSessionStore } from '@/stores/session'
-import { useAppStore } from '@/stores/app'
 import type { ChatSession, Workspace } from '@/types/models'
 import SessionListItem from '@/components/shell/SessionListItem.vue'
 import { projectName } from '@/utils/workspace'
@@ -21,19 +20,7 @@ const { t } = useI18n()
 const route = useRoute()
 const router = useRouter()
 const sessionStore = useSessionStore()
-const appStore = useAppStore()
 const message = useMessage()
-
-/** tooltip 主题：浅色下用白底浅字（默认深色底，项目行内视觉过重）；暗色下跟随 Naive 主题 */
-const tooltipTheme = computed(() =>
-  appStore.isDark
-    ? {}
-    : {
-        color: '#ffffff',
-        textColor: '#334155',
-        boxShadow: '0 2px 10px rgba(15, 23, 42, 0.1)',
-      },
-)
 
 /**
  * 两级结构：按 workspace 分组（数据来自后端预加载的 session.workspace；
@@ -529,7 +516,7 @@ async function onConfirmRemoveWorkspace() {
                @click.stop / @pointerdown.stop 防止点击按钮误触项目头的展开/折叠与拖拽。
                pointer-coarse 变体：触屏设备无 hover，三点按钮常显，保证手机端功能可达 -->
           <div
-            class="flex shrink-0 items-center gap-0.5"
+            class="flex shrink-0 items-center gap-1.5"
             @click.stop
             @pointerdown.stop
           >
@@ -554,32 +541,23 @@ async function onConfirmRemoveWorkspace() {
                 @click.stop
               >
                 <template #icon>
-                  <n-icon :size="18"><EllipsisHorizontalOutline /></n-icon>
+                  <n-icon :size="18"><EllipsisHorizontal /></n-icon>
                 </template>
               </n-button>
             </n-dropdown>
 
-            <!-- 新建会话：常驻最右，浅灰小图标 + tooltip；进入该项目的 /new 空态 -->
-            <n-tooltip
-              trigger="hover"
-              placement="top"
-              :theme-overrides="tooltipTheme"
+            <!-- 新建会话：常驻最右，浅灰小图标；进入该项目的 /new 空态 -->
+            <n-button
+              text
+              size="tiny"
+              class="text-ink-muted/50 hover:text-ink-secondary"
+              :aria-label="t('shell.newSession')"
+              @click="onNewSessionInWorkspace(group.workspace.id)"
             >
-              <template #trigger>
-                <n-button
-                  text
-                  size="tiny"
-                  class="text-ink-muted/50 hover:text-ink-secondary"
-                  :aria-label="t('shell.newSession')"
-                  @click="onNewSessionInWorkspace(group.workspace.id)"
-                >
-                  <template #icon>
-                    <n-icon :size="15"><AddOutline /></n-icon>
-                  </template>
-                </n-button>
+              <template #icon>
+                <n-icon :size="15"><AddOutline /></n-icon>
               </template>
-              {{ t('shell.newSession') }}
-            </n-tooltip>
+            </n-button>
           </div>
         </div>
         <!-- 项目下的会话列表（仅展开时渲染；按需分页，首包 20，最多 60） -->
