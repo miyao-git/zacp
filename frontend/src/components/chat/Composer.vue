@@ -2,7 +2,14 @@
 import { computed, h, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import type { VNodeChild } from 'vue'
 import { useI18n } from 'vue-i18n'
-import { AddOutline, ArrowUndoOutline, CreateOutline, OptionsOutline, Stop } from '@vicons/ionicons5'
+import {
+  AddOutline,
+  ArrowUndoOutline,
+  CreateOutline,
+  OptionsOutline,
+  ReturnDownForward,
+  Stop,
+} from '@vicons/ionicons5'
 import { NIcon, useMessage } from 'naive-ui'
 import type { InputInst, SelectGroupOption, SelectOption } from 'naive-ui'
 import { useSessionStore, MAX_TURNS_PER_SESSION, type SessionStreamStatus } from '@/stores/session'
@@ -738,6 +745,11 @@ function onKeydown(e: KeyboardEvent) {
         class="absolute inset-x-0 flex h-11 items-start gap-2 rounded-t-xl border border-divider bg-surface-raised px-3 pt-1 shadow-md"
         :style="steerLayerStyle(i)"
       >
+        <!-- 折线箭头（└ 形）：示意这条消息是从当前轮「分出去」的排队分支，
+             与输入框的从属关系一眼可辨；仅装饰，不参与交互 -->
+        <n-icon :size="14" class="mt-0.5 shrink-0 text-ink-muted" aria-hidden="true">
+          <ReturnDownForward />
+        </n-icon>
         <span class="min-w-0 flex-1 truncate text-sm leading-5 text-ink-secondary" :title="item.text">
           {{ item.text }}
         </span>
@@ -998,19 +1010,35 @@ function onKeydown(e: KeyboardEvent) {
 </template>
 
 <style scoped>
-/* 输入框与卡片融合成一个整体：去掉内部边框与聚焦描边/阴影，聚焦背景透明 */
+/* 输入框与卡片融合成一个整体：去掉内部边框 */
 .composer-input :deep(.n-input__border),
 .composer-input :deep(.n-input__state-border) {
   display: none;
 }
-.composer-input :deep(.n-input--focus),
-.composer-input :deep(.n-input--hover) {
-  background-color: transparent;
-  box-shadow: none;
-}
-/* 下拉选项去边框，与输入卡片融合；hover/聚焦阴影一并隐藏 */
+/* 下拉控件去边框，与输入卡片融合 */
 .opt-select :deep(.n-base-selection__border),
 .opt-select :deep(.n-base-selection__state-border) {
   display: none;
+}
+
+/*
+ * 暗色下控件不要自带底色，与输入卡片（bg-surface-raised）保持一致：
+ * naive 暗色主题给输入框铺了 rgba(255,255,255,.1)、聚焦时换 rgba(56,189,248,.1)，
+ * 给下拉控件（.n-base-selection-label）铺了同样的浅色底——在深色卡片上看起来像
+ * "另一个框"。这里把静止态与聚焦态设为透明；悬停/展开保留一档极淡的 hover 底
+ * （与全局 bg-surface-hover 同色），避免控件失去交互反馈。
+ * 亮色下卡片与控件本来同为白底，看不出差别，故只处理暗色。
+ * 下拉菜单（.n-base-select-menu）挂在 body、自带底色，不受这里影响。
+ * 注意：这些变量由 naive 以**内联样式**下发在控件元素上，覆盖必须加 !important；
+ * 且 .n-base-selection 才是变量的宿主元素，选择器必须落到它身上（写在 .opt-select
+ * 上会被其后代的内联声明盖过）。
+ */
+html.dark .composer-input {
+  --n-color: transparent !important;
+  --n-color-focus: transparent !important;
+}
+html.dark .opt-select :deep(.n-base-selection) {
+  --n-color: transparent !important;
+  --n-color-active: var(--color-surface-hover) !important;
 }
 </style>
